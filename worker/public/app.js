@@ -708,6 +708,14 @@ function renderViewer(machineId) {
         break;
       }
       case "ready": {
+        if (msg.codec !== "h264") {
+          // Connectors before the H.264 stream send JPEG tiles this viewer can't draw.
+          lastError = "The doremote app on this computer is out of date. It checks for updates hourly; choose Check for updates in its menu to update now.";
+          setStatus("error", "Error");
+          showOverlay("Update needed", lastError, { actions: true });
+          ws?.close(1000, "connector out of date");
+          break;
+        }
         const w = Number(msg.width);
         const hgt = Number(msg.height);
         if (w > 0 && hgt > 0) {
