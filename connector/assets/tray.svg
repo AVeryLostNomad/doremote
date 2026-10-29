@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Monochrome menu-bar/tray glyph: smiling monitor with a signal arc. -->
+  <path d="M25 9.5 a10 10 0 0 1 14 0" fill="none" stroke="#000" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="32" cy="15" r="2.6" fill="#000"/>
+  <path fill="#000" fill-rule="evenodd" d="
+    M14 20 h36 a7 7 0 0 1 7 7 v20 a7 7 0 0 1 -7 7 h-11 v3 h5 a2 2 0 0 1 0 4 h-24 a2 2 0 0 1 0 -4 h5 v-3 h-11 a7 7 0 0 1 -7 -7 v-20 a7 7 0 0 1 7 -7 z
+    M15 25 a2 2 0 0 0 -2 2 v20 a2 2 0 0 0 2 2 h34 a2 2 0 0 0 2 -2 v-20 a2 2 0 0 0 -2 -2 z"/>
+  <circle cx="25" cy="34" r="3" fill="#000"/>
+  <circle cx="39" cy="34" r="3" fill="#000"/>
+  <path d="M27 40.5 q5 4.5 10 0" fill="none" stroke="#000" stroke-width="3" stroke-linecap="round"/>
+</svg>

@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "doremote",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "routes": [{ "pattern": "doremote.dev", "custom_domain": true }],
+  "durable_objects": {
+    "bindings": [{ "name": "HUB", "class_name": "Hub" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Hub"] }],
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/auth/*", "/connect"],
+    "not_found_handling": "single-page-application"
+  },
+  "observability": { "enabled": true }
+  // Secrets (set with `wrangler secret put`): SESSION_SECRET, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET
+}

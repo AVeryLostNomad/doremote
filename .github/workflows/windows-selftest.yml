@@ -1,0 +1,51 @@
+name: Windows self-test
+
+# Exercises the Windows virtual display path on a real Windows machine: installs the Parsec
+# Virtual Display Driver, then runs `doremote -selftest` (virtual display, isolation, capture,
+# input injection, restore) and uploads the captured frame.
+on:
+  push:
+    branches: [main]
+    paths: ["connector/**", ".github/workflows/windows-selftest.yml"]
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: connector/go.mod
+          cache-dependency-path: connector/go.sum
+      - name: Vet and build (console subsystem so output is visible)
+        working-directory: connector
+        run: |
+          go vet ./...
+          go build -o doremote-console.exe .
+      - name: Install Parsec Virtual Display Driver
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://builds.parsec.app/vdd/parsec-vdd-0.45.0.0.exe -OutFile vdd.exe
+          Start-Process .\vdd.exe -ArgumentList '/S' -Wait
+          Get-PnpDevice -FriendlyName '*Parsec*' | Format-Table -AutoSize
+      - name: Display layout before
+        shell: pwsh
+        run: Get-CimInstance Win32_VideoController | Format-Table Name, CurrentHorizontalResolution, CurrentVerticalResolution
+      - name: Self-test without isolation
+        working-directory: connector
+        run: .\doremote-console.exe -selftest -no-isolate -selftest-out ..\selftest-plain.jpg
+      - name: Self-test with other displays switched off
+        working-directory: connector
+        run: .\doremote-console.exe -selftest -selftest-out ..\selftest-isolated.jpg
+      - name: Display layout after
+        if: always()
+        shell: pwsh
+        run: Get-CimInstance Win32_VideoController | Format-Table Name, CurrentHorizontalResolution, CurrentVerticalResolution
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-selftest
+          path: selftest-*.jpg
+          if-no-files-found: warn

@@ -1,0 +1,5 @@
+dist/
+connector/*.syso
+connector/*.exe
+*.jpg
+.DS_Store
