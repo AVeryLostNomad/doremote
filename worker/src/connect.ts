@@ -57,7 +57,9 @@ export function htmlResponse(title: string, bodyHtml: string, status = 200): Res
       "Content-Security-Policy": PAGE_CSP,
       "X-Frame-Options": "DENY",
       "X-Content-Type-Options": "nosniff",
-      "Referrer-Policy": "no-referrer",
+      // Not "no-referrer": under it browsers send `Origin: null` on the approve form's POST,
+      // which the origin check in handleConnect rejects.
+      "Referrer-Policy": "same-origin",
       "Cache-Control": "no-store",
     },
   });
