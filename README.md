@@ -65,4 +65,4 @@ The **Windows self-test** workflow installs the Parsec driver on a GitHub Window
 - JPEG tiles, not a video codec: busy screens can use 10–20+ Mbps, all relayed through a Durable Object.
 - The macOS app is not notarized; without a Developer ID, macOS asks for Screen Recording/Accessibility again after each update.
 - Windows needs the Parsec Virtual Display Driver; the secure desktop (UAC prompts, lock screen) cannot be captured from a user-mode app.
-- Windows support has been verified by cross-compilation, review and the CI self-test workflow, not yet on a physical Windows PC.
+- Windows is exercised by the self-test workflow on GitHub's Windows Server 2022 VMs (virtual display, isolation, capture, input, restore). It hasn't been run on a physical Windows PC or against the live portal yet.
