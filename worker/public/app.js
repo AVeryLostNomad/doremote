@@ -553,6 +553,21 @@ function closeMessage(code, reason) {
   }
 }
 
+/**
+ * WebCodecs codec string ("avc1.PPCCLL") from the SPS in an Annex B access unit, or "" if the
+ * access unit carries no SPS.
+ */
+function h264Codec(au) {
+  const hex = (b) => b.toString(16).padStart(2, "0");
+  for (let i = 0; i + 6 < au.length; i++) {
+    // NAL units follow a 00 00 01 start code (a 4-byte 00 00 00 01 ends with the same 3 bytes).
+    if (au[i] !== 0 || au[i + 1] !== 0 || au[i + 2] !== 1) continue;
+    if ((au[i + 3] & 0x1f) === 7) return `avc1.${hex(au[i + 4])}${hex(au[i + 5])}${hex(au[i + 6])}`;
+    i += 2;
+  }
+  return "";
+}
+
 function renderViewer(machineId) {
   const controller = new AbortController();
   const { signal } = controller;
@@ -618,7 +633,7 @@ function renderViewer(machineId) {
   let lastError = "";
   let frames = 0;
   let bytes = 0;
-  let decodeChain = Promise.resolve();
+  const video = createVideoSink();
 
   function setStatus(kind, text) {
     statusDot.className = `dot dot-${kind}`;
@@ -643,7 +658,7 @@ function renderViewer(machineId) {
   function connect() {
     live = false;
     lastError = "";
-    decodeChain = Promise.resolve();
+    video.reset();
     pressed.clear();
     lastMove = null;
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -667,7 +682,7 @@ function renderViewer(machineId) {
       if (ws !== socket) return;
       ws = null;
       live = false;
-      fpsEl.textContent = "— fps";
+      video.reset();
       const message = lastError || closeMessage(ev.code, ev.reason);
       setStatus(lastError || ev.code !== 1000 ? "error" : "offline", lastError ? "Error" : "Disconnected");
       showOverlay(lastError ? "Session failed" : "Disconnected", message, { actions: true });
@@ -717,58 +732,160 @@ function renderViewer(machineId) {
   }
 
   /**
-   * Frame update (little-endian): u16 rectCount, then per rect u16 x, u16 y, u16 w, u16 h,
-   * u32 jpegLength, jpeg bytes. Only regions that changed since the previous update are sent.
+   * Decodes the H.264 stream with WebCodecs and draws each picture as soon as it is decoded.
+   * Frame message (little-endian): u8 kind (1 = H.264), u8 flags (bit 0 keyframe), u16 width,
+   * u16 height, then one Annex B access unit. Every frame is acknowledged exactly once, in
+   * order, when it was drawn or dropped: the connector only sends a few frames ahead of acks
+   * and paces its bitrate by how quickly they come back.
    */
-  function parseUpdate(buf) {
-    const view = new DataView(buf);
-    const count = view.getUint16(0, true);
-    const rects = [];
-    let off = 2;
-    for (let i = 0; i < count; i++) {
-      const x = view.getUint16(off, true);
-      const y = view.getUint16(off + 2, true);
-      const w = view.getUint16(off + 4, true);
-      const hgt = view.getUint16(off + 6, true);
-      const len = view.getUint32(off + 8, true);
-      off += 12;
-      rects.push({ x, y, w, h: hgt, data: new Uint8Array(buf, off, len) });
-      off += len;
+  function createVideoSink() {
+    let decoder = null;
+    let codec = "";
+    let width = 0;
+    let height = 0;
+    let needKey = true;
+    let pending = 0; // chunks handed to the decoder whose picture hasn't come out yet
+    let timestamp = 0;
+    let stallTimer = 0;
+
+    function ack(n = 1) {
+      for (let i = 0; i < n; i++) if (ws && ws.readyState === WebSocket.OPEN) ws.send('{"t":"ack"}');
     }
-    return rects;
+
+    function drop() {
+      clearTimeout(stallTimer);
+      if (decoder && decoder.state !== "closed") decoder.close();
+      decoder = null;
+      codec = "";
+      ack(pending);
+      pending = 0;
+    }
+
+    /** Throws the decoder away and asks the connector for a fresh keyframe. */
+    function recover(reason) {
+      console.warn("video decoder reset:", reason);
+      drop();
+      needKey = true;
+      send({ t: "keyframe" });
+    }
+
+    function draw(frame) {
+      pending = Math.max(0, pending - 1);
+      clearTimeout(stallTimer);
+      if (pending > 0) stallTimer = setTimeout(() => recover("decoder stalled"), 2000);
+      try {
+        if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+          canvas.width = frame.displayWidth;
+          canvas.height = frame.displayHeight;
+          resEl.textContent = `${frame.displayWidth} × ${frame.displayHeight}`;
+        }
+        ctx.drawImage(frame, 0, 0);
+      } finally {
+        frame.close();
+      }
+      frames++;
+      ack();
+      if (!live && ws) {
+        live = true;
+        overlay.hidden = true;
+        setStatus("live", "Live");
+        canvas.focus({ preventScroll: true });
+      }
+    }
+
+    function decoderError(err) {
+      if (err.name === "NotSupportedError") unsupported(`${codec}: ${err.message}`);
+      else recover(err.message);
+    }
+
+    /** The browser can't decode this stream at all: retrying would only loop. */
+    function unsupported(detail) {
+      drop();
+      lastError = `This browser can't decode the stream (H.264 ${detail}).`;
+      setStatus("error", "Error");
+      showOverlay("Session failed", lastError, { actions: true });
+      ws?.close(1000, "unsupported codec");
+    }
+
+    function push(buf) {
+      const view = new DataView(buf);
+      if (buf.byteLength < 6 || view.getUint8(0) !== 1) {
+        ack();
+        return;
+      }
+      const key = (view.getUint8(1) & 1) !== 0;
+      const w = view.getUint16(2, true);
+      const hgt = view.getUint16(4, true);
+      const data = new Uint8Array(buf, 6);
+      if (needKey && !key) {
+        ack(); // undecodable without the keyframe that was lost; one is on its way
+        return;
+      }
+      if (key) {
+        const next = h264Codec(data);
+        if (next && (!decoder || next !== codec || w !== width || hgt !== height)) {
+          try {
+            decoder ??= new VideoDecoder({ output: draw, error: decoderError });
+            decoder.configure({ codec: next, codedWidth: w, codedHeight: hgt, optimizeForLatency: true });
+          } catch (err) {
+            ack();
+            unsupported(`${next}: ${err.message}`);
+            return;
+          }
+          codec = next;
+          width = w;
+          height = hgt;
+        }
+        if (!decoder) {
+          ack();
+          recover("keyframe without SPS");
+          return;
+        }
+        needKey = false;
+      }
+      if (!decoder) {
+        ack();
+        return;
+      }
+      try {
+        decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp, data }));
+      } catch (err) {
+        ack();
+        recover(err.message);
+        return;
+      }
+      timestamp += 16_667;
+      pending++;
+      if (pending === 1) {
+        clearTimeout(stallTimer);
+        stallTimer = setTimeout(() => recover("decoder stalled"), 2000);
+      }
+    }
+
+    return {
+      push,
+      /** Forgets all state, without acks: the socket the frames came from is gone or new. */
+      reset() {
+        pending = 0;
+        drop();
+        needKey = true;
+        timestamp = 0;
+      },
+    };
   }
 
   function handleFrame(socket, buf) {
     bytes += buf.byteLength;
-    decodeChain = decodeChain.then(async () => {
-      try {
-        const rects = parseUpdate(buf);
-        // Decode every rect before drawing any so an update never shows half-applied.
-        const bitmaps = await Promise.all(rects.map((r) => createImageBitmap(new Blob([r.data], { type: "image/jpeg" }))));
-        try {
-          const full = rects.length === 1 && rects[0].x === 0 && rects[0].y === 0;
-          if (full && (canvas.width !== rects[0].w || canvas.height !== rects[0].h)) {
-            canvas.width = rects[0].w;
-            canvas.height = rects[0].h;
-            resEl.textContent = `${rects[0].w} × ${rects[0].h}`;
-          }
-          rects.forEach((r, i) => ctx.drawImage(bitmaps[i], r.x, r.y));
-        } finally {
-          for (const b of bitmaps) b.close();
-        }
-        frames++;
-        if (!live && ws === socket) {
-          live = true;
-          overlay.hidden = true;
-          setStatus("live", "Live");
-          canvas.focus({ preventScroll: true });
-        }
-      } catch (err) {
-        console.warn("frame decode failed", err);
-      } finally {
-        if (socket.readyState === WebSocket.OPEN) socket.send('{"t":"ack"}');
+    if (ws !== socket) return;
+    if (typeof VideoDecoder === "undefined") {
+      if (!lastError) {
+        lastError = "This browser can't decode the stream: it needs WebCodecs (Chrome/Edge 94+, Safari 16.4+, Firefox 130+).";
+        setStatus("error", "Error");
+        showOverlay("Unsupported browser", lastError, { actions: true });
       }
-    });
+      return;
+    }
+    video.push(buf);
   }
 
   const statsTimer = setInterval(() => {
@@ -982,6 +1099,7 @@ function renderViewer(machineId) {
     controller.abort();
     clearInterval(statsTimer);
     if (rafId) cancelAnimationFrame(rafId);
+    video.reset();
     const socket = ws;
     ws = null;
     if (socket && socket.readyState <= WebSocket.OPEN) {

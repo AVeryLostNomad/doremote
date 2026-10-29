@@ -27,7 +27,7 @@ func main() {
 	cli := flag.Bool("cli", false, "run in the terminal without a menu-bar/tray icon")
 	logout := flag.Bool("logout", false, "forget this computer's link to your account and exit")
 	runSelftest := flag.Bool("selftest", false, "create a virtual display, capture and inject input locally, then exit")
-	selftestOut := flag.String("selftest-out", "doremote-selftest.jpg", "where -selftest writes the captured frame")
+	selftestOut := flag.String("selftest-out", "doremote-selftest.h264", "where -selftest writes the encoded frames (raw H.264)")
 	noIsolate := flag.Bool("no-isolate", false, "with -selftest: keep other screens on")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	updateFeed := flag.String("update-feed", defaultUpdateFeed, "GitHub releases URL the menu-bar/tray app updates from")

@@ -2,7 +2,7 @@ name: Windows self-test
 
 # Exercises the Windows virtual display path on a real Windows machine: installs the Parsec
 # Virtual Display Driver, then runs `doremote -selftest` (virtual display, isolation, capture,
-# input injection, restore) and uploads the captured frame.
+# H.264 encoding, input injection, restore) and uploads the encoded frames.
 on:
   push:
     branches: [main]
@@ -35,15 +35,21 @@ jobs:
           Invoke-WebRequest https://builds.parsec.app/vdd/parsec-vdd-0.45.0.0.exe -OutFile vdd.exe
           Start-Process .\vdd.exe -ArgumentList '/S' -Wait
           Get-PnpDevice -FriendlyName '*Parsec*' | Format-Table -AutoSize
+      - name: Enable Media Foundation (H.264 encoder; Windows Server lacks it by default)
+        shell: pwsh
+        run: |
+          if (-not (Get-WindowsFeature Server-Media-Foundation).Installed) {
+            Install-WindowsFeature Server-Media-Foundation | Format-List
+          }
       - name: Display layout before
         shell: pwsh
         run: Get-CimInstance Win32_VideoController | Format-Table Name, CurrentHorizontalResolution, CurrentVerticalResolution
       - name: Self-test without isolation
         working-directory: connector
-        run: .\doremote-console.exe -selftest -no-isolate -selftest-out ..\selftest-plain.jpg
+        run: .\doremote-console.exe -selftest -no-isolate -selftest-out ..\selftest-plain.h264
       - name: Self-test with other displays switched off
         working-directory: connector
-        run: .\doremote-console.exe -selftest -selftest-out ..\selftest-isolated.jpg
+        run: .\doremote-console.exe -selftest -selftest-out ..\selftest-isolated.h264
       - name: Display layout after
         if: always()
         shell: pwsh
@@ -52,5 +58,5 @@ jobs:
         if: always()
         with:
           name: windows-selftest
-          path: selftest-*.jpg
+          path: selftest-*.h264
           if-no-files-found: warn

@@ -4,6 +4,8 @@
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
+#import <VideoToolbox/VideoToolbox.h>
+#include <stdatomic.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <sys/time.h>
@@ -68,6 +70,7 @@ static void seterr(char *err, int errlen, NSString *msg) {
     CVPixelBufferRef latest;
     uint64_t seq;
     int stopped;
+    int keyRequested;
 }
 
 - (instancetype)init {
@@ -120,6 +123,19 @@ typedef struct {
     DRCapture *capture;
     dispatch_queue_t queue;
     uint64_t lastSeq;
+
+    // Encoder state, touched only by dr_next_video's caller (and dr_stop).
+    VTCompressionSessionRef vt;
+    int encWidth, encHeight;
+    int needKey;
+    CVPixelBufferRef last; // last encoded picture, for refinement and keyframe re-encodes
+    CMTime lastPts;
+    _Atomic int bitrate;
+    int appliedBitrate;
+    uint8_t *out;          // Annex B output of the current frame
+    size_t outLen, outCap;
+    int outReady, outKey;
+    OSStatus outStatus;
 
     CGEventSourceRef source;
     int buttons;           // bitmask of held DOM buttons
@@ -204,6 +220,13 @@ int dr_display_restore(int mode, const uint32_t *ids, int n) {
     return CGCompleteDisplayConfiguration(cfg, kCGConfigureForSession);
 }
 
+static void destroyEncoder(DRSession *s) {
+    if (!s->vt) return;
+    VTCompressionSessionInvalidate(s->vt);
+    CFRelease(s->vt);
+    s->vt = NULL;
+}
+
 static void stopSession(DRSession *s) {
     if (s->capture.stream) {
         dispatch_semaphore_t done = dispatch_semaphore_create(0);
@@ -213,6 +236,13 @@ static void stopSession(DRSession *s) {
     }
     s->display = nil; // releasing the CGVirtualDisplay removes it
     s->capture = nil;
+    destroyEncoder(s);
+    if (s->last) {
+        CVPixelBufferRelease(s->last);
+        s->last = NULL;
+    }
+    free(s->out);
+    s->out = NULL;
     if (s->source) {
         CFRelease(s->source);
         s->source = NULL;
@@ -243,7 +273,9 @@ static NSString *startCapture(DRSession *s) {
     SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
     cfg.width = (size_t)s->width;
     cfg.height = (size_t)s->height;
-    cfg.pixelFormat = kCVPixelFormatType_32BGRA;
+    // NV12 with the encoder's matrix, so SCK's pixel buffers go straight into VideoToolbox.
+    cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    cfg.colorMatrix = kCGDisplayStreamYCbCrMatrix_ITU_R_709_2;
     cfg.minimumFrameInterval = CMTimeMake(1, 60);
     cfg.queueDepth = 4;
     cfg.showsCursor = YES;
@@ -351,10 +383,215 @@ void dr_size(void *p, int *w, int *h) {
     *h = s->height;
 }
 
-int dr_next_frame(void *p, int timeout_ms, uint8_t *dst, int dst_cap, int *w, int *h) {
+// ---- Encoder ----
+
+static int appendOut(DRSession *s, const void *p, size_t n) {
+    if (s->outLen + n > s->outCap) {
+        size_t cap = s->outCap ? s->outCap : (size_t)1 << 16;
+        while (cap < s->outLen + n) cap *= 2;
+        uint8_t *b = realloc(s->out, cap);
+        if (!b) return 0;
+        s->out = b;
+        s->outCap = cap;
+    }
+    memcpy(s->out + s->outLen, p, n);
+    s->outLen += n;
+    return 1;
+}
+
+static int appendNAL(DRSession *s, const uint8_t *nal, size_t n) {
+    static const uint8_t startCode[4] = {0, 0, 0, 1};
+    return appendOut(s, startCode, sizeof startCode) && appendOut(s, nal, n);
+}
+
+// VideoToolbox emits AVCC (length-prefixed NAL units, SPS/PPS only in the format description);
+// the viewer decodes Annex B with parameter sets in-band.
+static OSStatus toAnnexB(DRSession *s, CMSampleBufferRef sb, int key) {
+    CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sb);
+    size_t count = 0;
+    int lenSize = 0;
+    OSStatus st = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, 0, NULL, NULL, &count, &lenSize);
+    if (st != noErr) return st;
+    if (key) {
+        for (size_t i = 0; i < count; i++) {
+            const uint8_t *ps = NULL;
+            size_t n = 0;
+            st = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, i, &ps, &n, NULL, NULL);
+            if (st != noErr) return st;
+            if (!appendNAL(s, ps, n)) return kVTAllocationFailedErr;
+        }
+    }
+
+    CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
+    size_t total = CMBlockBufferGetDataLength(bb);
+    size_t contiguous = 0;
+    char *data = NULL;
+    st = CMBlockBufferGetDataPointer(bb, 0, &contiguous, NULL, &data);
+    if (st != noErr) return st;
+    uint8_t *copy = NULL;
+    if (contiguous < total) {
+        copy = malloc(total);
+        if (!copy) return kVTAllocationFailedErr;
+        st = CMBlockBufferCopyDataBytes(bb, 0, total, copy);
+        if (st != noErr) {
+            free(copy);
+            return st;
+        }
+        data = (char *)copy;
+    }
+    const uint8_t *d = (const uint8_t *)data;
+    for (size_t off = 0; off + (size_t)lenSize <= total;) {
+        size_t n = 0;
+        for (int i = 0; i < lenSize; i++) n = n << 8 | d[off + (size_t)i];
+        off += (size_t)lenSize;
+        if (n > total - off) {
+            st = kVTVideoEncoderMalfunctionErr;
+            break;
+        }
+        if (!appendNAL(s, d + off, n)) {
+            st = kVTAllocationFailedErr;
+            break;
+        }
+        off += n;
+    }
+    free(copy);
+    return st;
+}
+
+// Runs before VTCompressionSessionCompleteFrames returns, so the frame is ready when encode does.
+static void encodedFrame(void *ref, void *frameRef, OSStatus status, VTEncodeInfoFlags flags, CMSampleBufferRef sb) {
+    DRSession *s = ref;
+    if (status != noErr) {
+        s->outStatus = status;
+        return;
+    }
+    if (!sb || (flags & kVTEncodeInfo_FrameDropped)) return;
+    int key = 1;
+    CFArrayRef att = CMSampleBufferGetSampleAttachmentsArray(sb, false);
+    if (att && CFArrayGetCount(att) > 0) {
+        CFDictionaryRef info = CFArrayGetValueAtIndex(att, 0);
+        CFBooleanRef notSync = NULL;
+        if (CFDictionaryGetValueIfPresent(info, kCMSampleAttachmentKey_NotSync, (const void **)&notSync) && notSync &&
+            CFBooleanGetValue(notSync)) {
+            key = 0;
+        }
+    }
+    s->outStatus = toAnnexB(s, sb, key);
+    s->outKey = key;
+    s->outReady = s->outStatus == noErr;
+}
+
+static void setProp(VTCompressionSessionRef vt, CFStringRef key, CFTypeRef value) {
+    OSStatus st = VTSessionSetProperty(vt, key, value);
+    if (st != noErr) NSLog(@"doremote: H.264 encoder rejected %@ (%d)", key, (int)st);
+}
+
+static void applyBitrate(DRSession *s, int bps) {
+    setProp(s->vt, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@(bps));
+    // Lets keyframes burst above the average but bounds sustained overshoot, so the link never
+    // builds a queue.
+    NSArray *limits = @[@((double)bps / 8 * 1.5), @1.0];
+    setProp(s->vt, kVTCompressionPropertyKey_DataRateLimits, (__bridge CFArrayRef)limits);
+    s->appliedBitrate = bps;
+}
+
+static OSStatus createEncoder(DRSession *s, int w, int h) {
+    destroyEncoder(s);
+    // Low-latency rate control keeps frame sizes steady and emits each frame immediately.
+    NSDictionary *spec = @{(__bridge NSString *)kVTVideoEncoderSpecification_EnableLowLatencyRateControl: @YES};
+    OSStatus st = VTCompressionSessionCreate(NULL, w, h, kCMVideoCodecType_H264, (__bridge CFDictionaryRef)spec, NULL,
+                                             NULL, encodedFrame, s, &s->vt);
+    int lowLatency = st == noErr;
+    if (!lowLatency) {
+        NSLog(@"doremote: low-latency H.264 encoder unavailable (%d), using the default one", (int)st);
+        st = VTCompressionSessionCreate(NULL, w, h, kCMVideoCodecType_H264, NULL, NULL, NULL, encodedFrame, s, &s->vt);
+        if (st != noErr) {
+            s->vt = NULL;
+            return st;
+        }
+    }
+    VTCompressionSessionRef vt = s->vt;
+    // The viewer decodes each frame as it arrives: no B-frames, no encoder delay.
+    if ((st = VTSessionSetProperty(vt, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)) != noErr ||
+        (st = VTSessionSetProperty(vt, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)) != noErr ||
+        (st = VTSessionSetProperty(vt, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel)) != noErr) {
+        destroyEncoder(s);
+        return st;
+    }
+    setProp(vt, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@60);
+    // Low-latency mode never delays frames and rejects this property.
+    if (!lowLatency) setProp(vt, kVTCompressionPropertyKey_MaxFrameDelayCount, (__bridge CFNumberRef)@0);
+    // Keyframes only on request (viewer join or decode error); periodic ones would waste bandwidth.
+    setProp(vt, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFNumberRef)@(INT32_MAX));
+    setProp(vt, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, (__bridge CFNumberRef)@(1e9));
+    // Signal BT.709 limited range (matching SCK's conversion) in the VUI so browsers convert correctly.
+    setProp(vt, kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2);
+    setProp(vt, kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
+    setProp(vt, kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2);
+    applyBitrate(s, atomic_load(&s->bitrate));
+    if ((st = VTCompressionSessionPrepareToEncodeFrames(vt)) != noErr) {
+        destroyEncoder(s);
+        return st;
+    }
+    s->encWidth = w;
+    s->encHeight = h;
+    s->needKey = 1;
+    return noErr;
+}
+
+static OSStatus encodeOnce(DRSession *s, CVPixelBufferRef pb) {
+    s->outLen = 0;
+    s->outReady = 0;
+    s->outKey = 0;
+    s->outStatus = noErr;
+    // Wall-clock timestamps let rate control see the real (variable) frame spacing.
+    CMTime pts = CMClockGetTime(CMClockGetHostTimeClock());
+    if (CMTIME_IS_VALID(s->lastPts) && CMTimeCompare(pts, s->lastPts) <= 0) {
+        pts = CMTimeAdd(s->lastPts, CMTimeMake(1, pts.timescale));
+    }
+    s->lastPts = pts;
+    NSDictionary *opts = s->needKey ? @{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES} : nil;
+    OSStatus st = VTCompressionSessionEncodeFrame(s->vt, pb, pts, kCMTimeInvalid, (__bridge CFDictionaryRef)opts, NULL, NULL);
+    if (st == noErr) st = VTCompressionSessionCompleteFrames(s->vt, kCMTimeInvalid);
+    return st != noErr ? st : s->outStatus;
+}
+
+static int encode(DRSession *s, CVPixelBufferRef pb, dr_video *out) {
+    int w = (int)CVPixelBufferGetWidth(pb);
+    int h = (int)CVPixelBufferGetHeight(pb);
+    OSStatus st = noErr;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        st = noErr;
+        if (!s->vt || w != s->encWidth || h != s->encHeight) st = createEncoder(s, w, h);
+        if (st == noErr) {
+            int bps = atomic_load(&s->bitrate);
+            if (bps != s->appliedBitrate) applyBitrate(s, bps);
+            st = encodeOnce(s, pb);
+        }
+        // The session dies on e.g. GPU resets; a fresh one starts with a keyframe.
+        if (st != kVTInvalidSessionErr) break;
+        destroyEncoder(s);
+    }
+    if (st != noErr) {
+        destroyEncoder(s);
+        out->status = (int)st;
+        return DR_VIDEO_ERROR;
+    }
+    if (!s->outReady) return DR_VIDEO_TIMEOUT; // dropped by rate control
+    if (s->outKey) s->needKey = 0;
+    out->data = s->out;
+    out->len = (int)s->outLen;
+    out->key = s->outKey;
+    out->width = w;
+    out->height = h;
+    return DR_VIDEO_FRAME;
+}
+
+int dr_next_video(void *p, int timeout_ms, int refine, dr_video *out) {
     DRSession *s = p;
     DRCapture *c = s->capture;
-    if (!c) return -1;
+    memset(out, 0, sizeof *out);
+    if (!c) return DR_VIDEO_STOPPED;
 
     struct timeval now;
     gettimeofday(&now, NULL);
@@ -363,43 +600,62 @@ int dr_next_frame(void *p, int timeout_ms, uint8_t *dst, int dst_cap, int *w, in
     deadline.tv_sec = now.tv_sec + (time_t)(ns / 1000000000LL);
     deadline.tv_nsec = (long)(ns % 1000000000LL);
 
+    CVPixelBufferRef pb = NULL;
     pthread_mutex_lock(&c->mu);
-    while (c->seq == s->lastSeq && !c->stopped) {
+    // A keyframe request on a still screen re-encodes the last picture; before the first
+    // picture it just waits, as the first frame is a keyframe anyway.
+    while (c->seq == s->lastSeq && !c->stopped && !(c->keyRequested && s->last)) {
         if (pthread_cond_timedwait(&c->cond, &c->mu, &deadline) != 0) break;
     }
     if (c->stopped) {
         pthread_mutex_unlock(&c->mu);
-        return -1;
+        return DR_VIDEO_STOPPED;
     }
-    if (c->seq == s->lastSeq || !c->latest) {
-        pthread_mutex_unlock(&c->mu);
-        return 0;
+    if (c->keyRequested) {
+        s->needKey = 1;
+        c->keyRequested = 0;
     }
-    CVPixelBufferRef pb = CVPixelBufferRetain(c->latest);
-    uint64_t seq = c->seq;
+    if (c->seq != s->lastSeq && c->latest) {
+        pb = CVPixelBufferRetain(c->latest);
+        s->lastSeq = c->seq;
+    }
     pthread_mutex_unlock(&c->mu);
 
-    int pw = (int)CVPixelBufferGetWidth(pb);
-    int ph = (int)CVPixelBufferGetHeight(pb);
-    *w = pw;
-    *h = ph;
-    if (pw * ph * 4 > dst_cap) {
-        CVPixelBufferRelease(pb);
-        return -2;
+    int refined = 0;
+    if (!pb && s->last && (s->needKey || refine)) {
+        pb = CVPixelBufferRetain(s->last);
+        refined = !s->needKey;
     }
-    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-    const uint8_t *src = CVPixelBufferGetBaseAddress(pb);
-    size_t stride = CVPixelBufferGetBytesPerRow(pb);
-    size_t row = (size_t)pw * 4;
-    if (stride == row) {
-        memcpy(dst, src, row * (size_t)ph);
-    } else {
-        for (int y = 0; y < ph; y++) memcpy(dst + (size_t)y * row, src + (size_t)y * stride, row);
+    if (!pb) return DR_VIDEO_TIMEOUT;
+
+    int rc;
+    @autoreleasepool {
+        rc = encode(s, pb, out);
     }
-    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    if (rc == DR_VIDEO_FRAME) {
+        out->refined = refined;
+        if (s->last != pb) {
+            if (s->last) CVPixelBufferRelease(s->last);
+            s->last = CVPixelBufferRetain(pb);
+        }
+    } else if (rc == DR_VIDEO_TIMEOUT && !refined) {
+        s->lastSeq = 0; // dropped: retry the latest picture on the next call
+    }
     CVPixelBufferRelease(pb);
-    s->lastSeq = seq;
-    return 1;
+    return rc;
+}
+
+void dr_request_keyframe(void *p) {
+    DRCapture *c = ((DRSession *)p)->capture;
+    if (!c) return; // the first frame is a keyframe anyway
+    pthread_mutex_lock(&c->mu);
+    c->keyRequested = 1;
+    pthread_cond_broadcast(&c->cond);
+    pthread_mutex_unlock(&c->mu);
+}
+
+void dr_set_bitrate(void *p, int bps) {
+    if (bps > 0) atomic_store(&((DRSession *)p)->bitrate, bps);
 }
 
 void dr_stop(void *p) {

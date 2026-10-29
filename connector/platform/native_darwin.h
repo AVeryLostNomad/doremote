@@ -25,9 +25,29 @@ void *dr_start(int width, int height, char *err, int errlen);
 uint32_t dr_display_id(void *s);
 int dr_start_capture(void *s, char *err, int errlen);
 void dr_size(void *s, int *width, int *height);
-// Returns 1 when a frame was copied, 0 on timeout, -1 when the stream stopped,
-// -2 when dst is too small (w/h are still filled in).
-int dr_next_frame(void *s, int timeout_ms, uint8_t *dst, int dst_cap, int *w, int *h);
+
+// dr_next_video results.
+#define DR_VIDEO_FRAME 1
+#define DR_VIDEO_TIMEOUT 0
+#define DR_VIDEO_STOPPED -1
+#define DR_VIDEO_ERROR -2
+
+typedef struct {
+    const uint8_t *data; // Annex B access unit, owned by the session, valid until the next dr_next_video/dr_stop
+    int len;
+    int key;             // IDR with SPS/PPS in-band
+    int refined;         // re-encoding of the previous picture, not a new one
+    int width, height;
+    int status;          // OSStatus for DR_VIDEO_ERROR
+} dr_video;
+
+// Waits up to timeout_ms for a new screen picture (or a keyframe request) and encodes it
+// synchronously. With refine set, a timeout re-encodes the last picture instead. Call from one
+// thread at a time; nothing is encoded between calls.
+int dr_next_video(void *s, int timeout_ms, int refine, dr_video *out);
+// Thread-safe; both take effect on the next encoded frame (a pending dr_next_video wakes for a keyframe).
+void dr_request_keyframe(void *s);
+void dr_set_bitrate(void *s, int bps);
 void dr_stop(void *s);
 
 void dr_mouse_move(void *s, int x, int y);

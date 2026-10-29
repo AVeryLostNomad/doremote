@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"log"
@@ -12,11 +13,21 @@ import (
 	"github.com/joey/doremote/connector/platform"
 )
 
-// maxInflight bounds frames sent but not yet acknowledged by the viewer, which keeps latency
-// low on slow links instead of queueing stale frames.
-const maxInflight = 2
+const (
+	// maxInflight bounds frames sent but not yet acknowledged by the viewer. Encoding waits for
+	// a free slot instead of queueing frames, so a slow link costs frame rate, not latency;
+	// the rate controller lowers the bitrate so the slots free up quickly again.
+	maxInflight = 4
+	// sendBuffers holds the frame being written, one queued behind it and one being encoded.
+	sendBuffers = 3
 
-const minFrameInterval = time.Second / 30
+	minFrameInterval = time.Second / platform.MaxFrameRate
+
+	// Video message header: u8 kind, u8 flags, u16 width, u16 height (little-endian).
+	videoHeaderLen = 6
+	kindH264       = 1
+	flagKeyframe   = 1
+)
 
 type inputMsg struct {
 	T    string  `json:"t"`
@@ -39,7 +50,8 @@ func (c *client) stream(ctx context.Context, sid string, width, height int) erro
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	sess, err := platform.Start(platform.Options{Width: width, Height: height, Isolate: c.isolate()})
+	rc := newRateControl(width, height, time.Now())
+	sess, err := platform.Start(platform.Options{Width: width, Height: height, Isolate: c.isolate(), Bitrate: rc.bitrate})
 	if err != nil {
 		sendJSON(ctx, conn, map[string]string{"t": "error", "message": err.Error()})
 		conn.Close(websocket.StatusNormalClosure, "display setup failed")
@@ -49,7 +61,7 @@ func (c *client) stream(ctx context.Context, sid string, width, height int) erro
 	defer sess.ReleaseAll()
 
 	w, h := sess.Size()
-	if err := sendJSON(ctx, conn, map[string]any{"t": "ready", "width": w, "height": h}); err != nil {
+	if err := sendJSON(ctx, conn, map[string]any{"t": "ready", "width": w, "height": h, "codec": "h264"}); err != nil {
 		return err
 	}
 
@@ -57,18 +69,26 @@ func (c *client) stream(ctx context.Context, sid string, width, height int) erro
 	for range maxInflight {
 		credits <- struct{}{}
 	}
+	free := make(chan []byte, sendBuffers)
+	for range sendBuffers {
+		free <- nil
+	}
+	queued := make(chan []byte, 1)
 
-	errc := make(chan error, 2)
-	go func() { errc <- readInput(ctx, conn, sess, credits) }()
-	go func() { errc <- sendFrames(ctx, conn, sess, credits) }()
+	errc := make(chan error, 3)
+	go func() { errc <- readInput(ctx, conn, sess, credits, rc) }()
+	go func() { errc <- encodeFrames(ctx, sess, credits, free, queued) }()
+	go func() { errc <- sendFrames(ctx, conn, free, queued, rc) }()
 	err = <-errc
 	cancel()
 	conn.Close(websocket.StatusNormalClosure, "session ended")
-	<-errc // both goroutines are done before ReleaseAll/Close touch the session
+	// All goroutines are done before ReleaseAll/Close touch the session.
+	<-errc
+	<-errc
 	return err
 }
 
-func readInput(ctx context.Context, conn *websocket.Conn, sess platform.Session, credits chan struct{}) error {
+func readInput(ctx context.Context, conn *websocket.Conn, sess platform.Session, credits chan struct{}, rc *rateControl) error {
 	for {
 		_, data, err := conn.Read(ctx)
 		if err != nil {
@@ -80,10 +100,15 @@ func readInput(ctx context.Context, conn *websocket.Conn, sess platform.Session,
 		}
 		switch m.T {
 		case "ack":
+			if bps, changed := rc.acked(time.Now()); changed {
+				sess.SetBitrate(bps)
+			}
 			select {
 			case credits <- struct{}{}:
 			default:
 			}
+		case "keyframe":
+			sess.RequestKeyframe()
 		case "move":
 			err = sess.MouseMove(m.X, m.Y)
 		case "button":
@@ -103,8 +128,9 @@ func readInput(ctx context.Context, conn *websocket.Conn, sess platform.Session,
 	}
 }
 
-func sendFrames(ctx context.Context, conn *websocket.Conn, sess platform.Session, credits chan struct{}) error {
-	var enc frameEncoder
+// encodeFrames pulls encoded frames while the viewer has room for them and hands them to
+// sendFrames, so the next frame is captured and encoded while the previous one is in transit.
+func encodeFrames(ctx context.Context, sess platform.Session, credits chan struct{}, free, queued chan []byte) error {
 	var last time.Time
 	for {
 		select {
@@ -119,24 +145,53 @@ func sendFrames(ctx context.Context, conn *websocket.Conn, sess platform.Session
 				return ctx.Err()
 			}
 		}
-		var msg []byte
-		for msg == nil {
-			f, err := sess.NextFrame(ctx)
-			if err != nil {
-				return err
-			}
-			// nil means the capture API reported a frame identical to the last one sent.
-			if msg, err = enc.encode(f); err != nil {
-				return err
-			}
+		f, err := sess.NextFrame(ctx)
+		if err != nil {
+			return err
 		}
 		last = time.Now()
+		var buf []byte
+		select {
+		case buf = <-free:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		buf = appendVideoMessage(buf[:0], f)
+		select {
+		case queued <- buf:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func appendVideoMessage(buf []byte, f *platform.VideoFrame) []byte {
+	var flags byte
+	if f.Key {
+		flags |= flagKeyframe
+	}
+	buf = append(buf, kindH264, flags)
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(f.Width))
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(f.Height))
+	return append(buf, f.Data...)
+}
+
+func sendFrames(ctx context.Context, conn *websocket.Conn, free, queued chan []byte, rc *rateControl) error {
+	for {
+		var msg []byte
+		select {
+		case msg = <-queued:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		rc.sent(len(msg), msg[1]&flagKeyframe != 0, time.Now())
 		wctx, wcancel := context.WithTimeout(ctx, 15*time.Second)
 		err := conn.Write(wctx, websocket.MessageBinary, msg)
 		wcancel()
 		if err != nil {
 			return err
 		}
+		free <- msg
 	}
 }
 

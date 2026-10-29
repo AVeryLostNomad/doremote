@@ -2,7 +2,7 @@ package platform
 
 /*
 #cgo CFLAGS: -fobjc-arc
-#cgo LDFLAGS: -framework Foundation -framework CoreGraphics -framework ApplicationServices -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo
+#cgo LDFLAGS: -framework Foundation -framework CoreGraphics -framework ApplicationServices -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo -framework VideoToolbox
 #include <stdlib.h>
 #include "native_darwin.h"
 */
@@ -39,17 +39,21 @@ func Preflight() error {
 }
 
 type darwinSession struct {
-	// mu guards ptr: capture and input hold it shared (they touch disjoint C state), Close exclusively.
+	// mu guards ptr: capture, encoder control and input hold it shared (they touch disjoint C
+	// state), Close exclusively.
 	mu       sync.RWMutex
 	ptr      unsafe.Pointer
 	isolated []uint32 // displays switched off for this session
 	w, h     int
-	buf      []byte
-	frame    Frame
-	wheelX   float64
-	wheelY   float64
-	held     map[string]bool
-	btns     map[int]bool
+	// NextFrame state.
+	buf     []byte
+	frame   VideoFrame
+	lastAt  time.Time // when the last frame was returned
+	refines int       // refinements of the current picture returned so far
+	wheelX  float64
+	wheelY  float64
+	held    map[string]bool
+	btns    map[int]bool
 }
 
 // Start creates a CGVirtualDisplay, optionally switches other displays off, and starts capture.
@@ -66,6 +70,11 @@ func Start(opts Options) (Session, error) {
 	var w, h C.int
 	C.dr_size(p, &w, &h)
 	s := &darwinSession{ptr: p, w: int(w), h: int(h), held: map[string]bool{}, btns: map[int]bool{}}
+	bitrate := opts.Bitrate
+	if bitrate <= 0 {
+		bitrate = int(float64(s.w*s.h) * MaxFrameRate * 0.05)
+	}
+	C.dr_set_bitrate(p, C.int(bitrate))
 
 	if opts.Isolate {
 		if err := s.isolate(uint32(C.dr_display_id(p))); err != nil {
@@ -191,35 +200,58 @@ func (s *darwinSession) Size() (int, int) { return s.w, s.h }
 
 var errClosed = errors.New("session closed")
 
-func (s *darwinSession) NextFrame(ctx context.Context) (*Frame, error) {
+func (s *darwinSession) NextFrame(ctx context.Context) (*VideoFrame, error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+		// Wait in short slices so ctx is honoured; the last slice before a due refinement
+		// re-encodes the still picture when it times out.
+		wait, refine := 100*time.Millisecond, false
+		if s.refines < RefineFrames && !s.lastAt.IsZero() {
+			if due := time.Until(s.lastAt.Add(RefineDelay)); due <= wait {
+				wait, refine = max(due, 0), true
+			}
 		}
 		s.mu.RLock()
 		if s.ptr == nil {
 			s.mu.RUnlock()
 			return nil, errClosed
 		}
-		if s.buf == nil {
-			s.buf = make([]byte, s.w*s.h*4)
+		var v C.dr_video
+		rc := C.dr_next_video(s.ptr, C.int((wait+time.Millisecond-1)/time.Millisecond), cbool(refine), &v)
+		if rc == C.DR_VIDEO_FRAME {
+			// Copy out under the lock: Close frees the C buffer, and callers may still be
+			// sending the frame when another goroutine closes the session.
+			s.buf = append(s.buf[:0], unsafe.Slice((*byte)(unsafe.Pointer(v.data)), int(v.len))...)
 		}
-		var w, h C.int
-		rc := C.dr_next_frame(s.ptr, 100, (*C.uint8_t)(unsafe.Pointer(&s.buf[0])), C.int(len(s.buf)), &w, &h)
 		s.mu.RUnlock()
 		switch rc {
-		case 1:
-			s.frame = Frame{Width: int(w), Height: int(h), Stride: int(w) * 4, Pix: s.buf[:int(w)*int(h)*4]}
+		case C.DR_VIDEO_FRAME:
+			s.lastAt = time.Now()
+			if v.refined != 0 {
+				s.refines++
+			} else {
+				s.refines = 0
+			}
+			s.frame = VideoFrame{Data: s.buf, Key: v.key != 0, Width: int(v.width), Height: int(v.height)}
 			return &s.frame, nil
-		case 0:
+		case C.DR_VIDEO_TIMEOUT:
 			continue
-		case -2:
-			s.buf = make([]byte, int(w)*int(h)*4)
-			continue
-		default:
+		case C.DR_VIDEO_STOPPED:
 			return nil, errors.New("screen capture stopped")
+		default:
+			return nil, fmt.Errorf("H.264 encoder failed (OSStatus %d)", int(v.status))
 		}
 	}
+}
+
+func (s *darwinSession) RequestKeyframe() {
+	s.with(func(p unsafe.Pointer) { C.dr_request_keyframe(p) })
+}
+
+func (s *darwinSession) SetBitrate(bps int) {
+	s.with(func(p unsafe.Pointer) { C.dr_set_bitrate(p, C.int(bps)) })
 }
 
 func (s *darwinSession) with(fn func(p unsafe.Pointer)) error {

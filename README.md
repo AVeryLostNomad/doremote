@@ -13,7 +13,7 @@ flowchart LR
 | Part | Path | Stack |
 | --- | --- | --- |
 | Portal + relay | `worker/` | Cloudflare Worker, Durable Objects (hibernatable WebSockets), static assets, GitHub OAuth |
-| Connector | `connector/` | Go; macOS: CGVirtualDisplay + ScreenCaptureKit + CGEvent (cgo); Windows: Parsec Virtual Display Driver + CCD display API + GDI capture + SendInput |
+| Connector | `connector/` | Go; macOS: CGVirtualDisplay + ScreenCaptureKit + VideoToolbox H.264 + CGEvent (cgo); Windows: Parsec Virtual Display Driver + CCD display API + DXGI Desktop Duplication (GDI fallback) + Media Foundation H.264 + SendInput |
 | Packaging | `packaging/`, `.github/workflows/` | universal Developer ID signed `doremote.app`, `doremote.exe` with icon/manifest, GitHub release on every connector change to `main` |
 
 ## Using it
@@ -26,7 +26,7 @@ On first launch the browser opens doremote.dev: sign in with GitHub and click **
 
 Menu: status, **Open doremote**, **Turn off other screens during sessions** (on by default; off keeps local screens on), **Sign in again…** (re-link to another account), **Show log**, the update state (click to check now), **Quit**.
 
-Command-line flags (handy for development): `-cli` (no tray, logs to the terminal), `-server http://localhost:8787`, `-name`, `-logout`, `-selftest [-no-isolate]` (creates a virtual display, isolates, captures a frame to `doremote-selftest.jpg`, injects input, restores), `-update-feed` (releases URL to update from), `-version`.
+Command-line flags (handy for development): `-cli` (no tray, logs to the terminal), `-server http://localhost:8787`, `-name`, `-logout`, `-selftest [-no-isolate]` (creates a virtual display, isolates, captures and encodes a few frames to `doremote-selftest.h264`, injects input, restores; view the output with `ffplay`), `-update-feed` (releases URL to update from), `-version`.
 
 ### Updates
 
@@ -82,18 +82,20 @@ Rulesets block force-pushes to and deletion of `main`, and moving or deleting `v
 
 Build locally with `VERSION=0.1.0 packaging/macos/build.sh` and `VERSION=0.1.0 packaging/windows/build.sh` (outputs in `dist/`). The macOS script signs with the first Developer ID Application identity in your keychain (`SIGN_IDENTITY=-` for ad-hoc) and notarizes when `NOTARY_PROFILE` or `APPLE_ID` + `APPLE_APP_PASSWORD` is set.
 
-The **Windows self-test** workflow installs the Parsec driver on a GitHub Windows runner and runs `doremote -selftest` with and without isolation, uploading the captured frames.
+The **Windows self-test** workflow installs the Parsec driver (and Media Foundation, which Windows Server lacks) on a GitHub Windows runner and runs `doremote -selftest` with and without isolation, uploading the encoded frames.
 
 ## Protocol
 
 - Pairing: the connector listens on `127.0.0.1:<port>` and opens `/connect?port&state&name&os`; after GitHub sign-in and approval the portal redirects to the loopback with a connector token (HS256 JWT bound to the user and a machine id). Removing the machine on the portal revokes it.
 - Control socket `/api/connector/ws`: `hello` → hub; hub → `session {sid,width,height}` / `end {sid}`.
 - Per-session stream `/api/connector/stream?sid=` paired by the hub with the viewer socket `/api/machines/:id/view`; messages relay verbatim.
-- Frames: binary `u16 count` then per changed region `u16 x,y,w,h, u32 len, JPEG` (64 px tiles, merged per row; full frame when more than half changed), at most 30/s and 2 unacknowledged. Viewer input: JSON `move`, `button`, `wheel`, `key` (DOM `code`), `release`, `ack`.
+- Frames: binary `u8 kind (1 = H.264), u8 flags (bit 0 keyframe), u16 width, u16 height` (little-endian), then one Annex B access unit (no B-frames; keyframes carry SPS/PPS). The browser decodes them with WebCodecs. The connector encodes only when the screen changed (plus two refinement frames once it is still again), at most 60/s and 4 unacknowledged, and adapts the bitrate to how late acks return. Viewer input: JSON `move`, `button`, `wheel`, `key` (DOM `code`), `release`, `ack` (one per frame, after it was drawn or dropped), `keyframe` (after a decoder error).
 
 ## Limitations
 
-- JPEG tiles, not a video codec: busy screens can use 10–20+ Mbps, all relayed through a Durable Object.
+- All video is relayed through a Durable Object, so it takes the detour through the data center the user's Hub lives in, and frame rate is bound by the ack round trip over that path.
+- 4:2:0 H.264 softens fine coloured text slightly compared with lossless remote desktop codecs.
+- The viewer needs WebCodecs (Chrome/Edge 94+, Safari 16.4+, Firefox 130+). Windows N editions need the Media Feature Pack for the H.264 encoder.
 - Windows builds are not Authenticode signed; SmartScreen warns on first download. Updates are verified by the signed manifest instead.
 - Windows needs the Parsec Virtual Display Driver; the secure desktop (UAC prompts, lock screen) cannot be captured from a user-mode app.
 - Windows is exercised by the self-test workflow on GitHub's Windows Server 2022 VMs (virtual display, isolation, capture, input, restore). It hasn't been run on a physical Windows PC or against the live portal yet.
