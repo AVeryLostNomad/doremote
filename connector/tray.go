@@ -17,7 +17,7 @@ import (
 
 // runTray shows the menu-bar (macOS) / notification-area (Windows) UI and runs the connector
 // until the user quits.
-func runTray(a *app, statusUpdates <-chan string) {
+func runTray(a *app, statusUpdates <-chan string, updateFeed string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var done sync.WaitGroup
 
@@ -35,6 +35,8 @@ func runTray(a *app, statusUpdates <-chan string) {
 			"Move all windows onto the remote session's virtual display", !a.keepScreensOn.Load())
 		mRelink := systray.AddMenuItem("Sign in again…", "Link this computer to a GitHub account")
 		mLog := systray.AddMenuItem("Show log", "")
+		mUpdate := systray.AddMenuItem("", "Updates install automatically from GitHub Releases")
+		mUpdate.Hide()
 		systray.AddSeparator()
 		mQuit := systray.AddMenuItem("Quit doremote", "")
 
@@ -75,6 +77,13 @@ func runTray(a *app, statusUpdates <-chan string) {
 			}
 		}()
 
+		// quit restores displays (ending any session) before the menu disappears.
+		quit := func() {
+			cancel()
+			done.Wait()
+			systray.Quit()
+		}
+
 		go func() {
 			for {
 				select {
@@ -95,13 +104,31 @@ func runTray(a *app, statusUpdates <-chan string) {
 					}
 				case <-mQuit.ClickedCh:
 					mStatus.SetTitle("Quitting…")
-					cancel()
-					done.Wait()
-					systray.Quit()
+					quit()
 					return
 				}
 			}
 		}()
+
+		if updatesSupported() {
+			check := make(chan struct{}, 1)
+			u := &updater{feed: updateFeed, current: version, busy: a.inSession, check: check,
+				status: mUpdate.SetTitle,
+				restart: func() {
+					mStatus.SetTitle("Restarting to update…")
+					quit()
+				}}
+			mUpdate.Show()
+			go func() {
+				for range mUpdate.ClickedCh {
+					select {
+					case check <- struct{}{}:
+					default:
+					}
+				}
+			}()
+			go u.run(ctx)
+		}
 
 		done.Add(1)
 		go func() {

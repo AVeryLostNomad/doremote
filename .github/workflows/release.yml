@@ -1,65 +1,199 @@
 name: Release
 
-# Push a tag like v0.1.0 to build the connector for macOS and Windows and publish a GitHub
-# release with both attached. Run manually (workflow_dispatch) to build without releasing.
+# Every push to main that touches the connector cuts a release: the next patch version (or the
+# bump chosen when run by hand) is built for macOS (Developer ID signed, notarized, stapled) and
+# Windows, then published with update.json + update.json.sig, which installed connectors poll
+# and verify against the Ed25519 key compiled into them (connector/update.go).
+#
+# Secrets live in the "release" environment, which only main may deploy to:
+#   MACOS_CERT_P12, MACOS_CERT_PASSWORD  Developer ID Application identity (base64 .p12)
+#   APPLE_APP_PASSWORD                   app-specific password of the notarizing Apple ID
+#                                        (optional: without it the app is signed, not notarized)
+#   UPDATE_SIGNING_KEY                   Ed25519 private key (PEM) that signs update.json
+# and the environment variable APPLE_ID.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths:
+      - "connector/**"
+      - "packaging/**"
+      - ".github/workflows/release.yml"
   workflow_dispatch:
+    inputs:
+      bump:
+        description: Version part to increase
+        type: choice
+        options: [patch, minor, major]
+        default: patch
 
 permissions:
-  contents: write
+  contents: read
+
+# Releases run one at a time; a burst of merges collapses into one release of the latest commit.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
-  macos:
-    runs-on: macos-15
+  version:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: next
+        env:
+          BUMP: ${{ inputs.bump || 'patch' }}
+        run: |
+          last="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
+          IFS=. read -r major minor patch <<<"${last#v}"
+          major="${major:-0}" minor="${minor:-0}" patch="${patch:-0}"
+          case "$BUMP" in
+            major) major=$((major + 1)) minor=0 patch=0 ;;
+            minor) minor=$((minor + 1)) patch=0 ;;
+            *) patch=$((patch + 1)) ;;
+          esac
+          echo "version=$major.$minor.$patch" >> "$GITHUB_OUTPUT"
+          echo "${last:-none} -> $major.$minor.$patch"
+
+  macos:
+    needs: version
+    runs-on: macos-15
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: connector/go.mod
-          cache-dependency-path: connector/go.sum
-      - name: Build doremote.app (universal)
-        run: VERSION="${GITHUB_REF_NAME#v}" packaging/macos/build.sh
-      - uses: actions/upload-artifact@v4
+          cache: false
+      - name: Import the Developer ID identity into a temporary keychain
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/cert.p12"
+          # Intermediate that issued the certificate, in case the runner image lacks it.
+          curl -fsSL https://www.apple.com/certificateauthority/DeveloperIDCA.cer -o "$RUNNER_TEMP/DeveloperIDCA.cer"
+          security import "$RUNNER_TEMP/DeveloperIDCA.cer" -k "$KEYCHAIN" || true
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security find-identity -v -p codesigning "$KEYCHAIN"
+      - name: Build, sign and notarize doremote.app (universal)
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          SIGN_IDENTITY: "Developer ID Application: Joey Maher (8VSK2S4PQ7)"
+          APPLE_ID: ${{ vars.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_APP_PASSWORD" ]; then
+            echo "::warning::APPLE_APP_PASSWORD is not set: the app is signed but not notarized, so first-time downloads need Open Anyway. Updates are unaffected."
+          fi
+          packaging/macos/build.sh
+      - name: Check what connectors will verify
+        env:
+          NOTARIZED: ${{ secrets.APPLE_APP_PASSWORD != '' }}
+        run: |
+          ditto -x -k dist/doremote-macos.zip "$RUNNER_TEMP/check"
+          codesign --verify --deep --strict \
+            '-R=anchor apple generic and identifier "dev.doremote.connector" and certificate leaf[subject.OU] = "8VSK2S4PQ7"' \
+            "$RUNNER_TEMP/check/doremote.app"
+          if [ "$NOTARIZED" = true ]; then
+            xcrun stapler validate "$RUNNER_TEMP/check/doremote.app"
+            spctl --assess --type execute --verbose "$RUNNER_TEMP/check/doremote.app"
+          fi
+      - name: Remove the temporary keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos
           path: dist/doremote-macos.zip
           if-no-files-found: error
 
   windows:
+    needs: version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: connector/go.mod
-          cache-dependency-path: connector/go.sum
+          cache: false
       - name: Build doremote.exe (amd64, arm64)
-        run: VERSION="${GITHUB_REF_NAME#v}" packaging/windows/build.sh
-      - uses: actions/upload-artifact@v4
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: packaging/windows/build.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows
           path: dist/doremote-windows-*.exe
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [macos, windows]
+    needs: [version, macos, windows]
     runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: connector/update.go
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          body: |
-            **macOS** — download `doremote-macos.zip`, unzip, move `doremote.app` to Applications, then right-click → Open the first time (the app is not notarized). Grant Screen Recording and Accessibility when asked.
-
-            **Windows** — download `doremote-windows-amd64.exe` (or `-arm64` for ARM PCs) and run it. If SmartScreen warns, choose More info → Run anyway. Use the tray menu's "Install the virtual display driver…" the first time.
-          files: |
-            dist/doremote-macos.zip
-            dist/doremote-windows-amd64.exe
-            dist/doremote-windows-arm64.exe
+      - name: Write and sign update.json
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          cd dist
+          sha() { sha256sum "$1" | cut -d' ' -f1; }
+          jq -n --arg v "$VERSION" \
+            --arg mac "$(sha doremote-macos.zip)" \
+            --arg amd64 "$(sha doremote-windows-amd64.exe)" \
+            --arg arm64 "$(sha doremote-windows-arm64.exe)" \
+            '{version: $v, assets: {
+               "darwin": {file: "doremote-macos.zip", sha256: $mac},
+               "windows-amd64": {file: "doremote-windows-amd64.exe", sha256: $amd64},
+               "windows-arm64": {file: "doremote-windows-arm64.exe", sha256: $arm64}}}' > update.json
+          cat update.json
+          umask 077
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$RUNNER_TEMP/update-key.pem"
+          openssl pkeyutl -sign -inkey "$RUNNER_TEMP/update-key.pem" -rawin -in update.json -out "$RUNNER_TEMP/update.sig"
+          rm "$RUNNER_TEMP/update-key.pem"
+          base64 -w0 "$RUNNER_TEMP/update.sig" > update.json.sig
+          # Verify with the key the connectors trust, so a mismatched secret cannot ship a
+          # release that no installed connector would accept.
+          pub="$(sed -n 's/^[[:space:]]*updatePublicKey[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' ../connector/update.go)"
+          { printf '302a300506032b6570032100' | xxd -r -p; echo "$pub" | base64 -d; } > "$RUNNER_TEMP/pub.der"
+          openssl pkey -pubin -inform DER -in "$RUNNER_TEMP/pub.der" -out "$RUNNER_TEMP/pub.pem"
+          openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/pub.pem" -rawin -in update.json -sigfile "$RUNNER_TEMP/update.sig"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "v$VERSION" --generate-notes \
+            --notes "Installed connectors update themselves. New install: **macOS** \`doremote-macos.zip\` (unzip, move doremote.app to Applications); **Windows** \`doremote-windows-amd64.exe\` (\`-arm64\` for ARM PCs; SmartScreen may need More info → Run anyway)." \
+            dist/doremote-macos.zip dist/doremote-windows-amd64.exe dist/doremote-windows-arm64.exe \
+            dist/update.json dist/update.json.sig

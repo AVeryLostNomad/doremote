@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/joey/doremote/connector/platform"
 )
@@ -29,6 +30,8 @@ func main() {
 	selftestOut := flag.String("selftest-out", "doremote-selftest.jpg", "where -selftest writes the captured frame")
 	noIsolate := flag.Bool("no-isolate", false, "with -selftest: keep other screens on")
 	showVersion := flag.Bool("version", false, "print the version and exit")
+	updateFeed := flag.String("update-feed", defaultUpdateFeed, "GitHub releases URL the menu-bar/tray app updates from")
+	updated := flag.Bool("updated", false, "started by the previous version after an update: wait for it to exit")
 	flag.Parse()
 	log.SetFlags(log.LstdFlags)
 
@@ -46,6 +49,11 @@ func main() {
 	// One connector per user: a second copy would fight over the account link, and macOS
 	// ScreenCaptureKit stalls when two processes of the same executable capture.
 	unlock, err := lockInstance()
+	// After an update the previous version is still shutting down and holds the lock.
+	for deadline := time.Now().Add(time.Minute); *updated && errors.Is(err, errAlreadyRunning) && time.Now().Before(deadline); {
+		time.Sleep(250 * time.Millisecond)
+		unlock, err = lockInstance()
+	}
 	if err != nil {
 		fatal(err)
 	}
@@ -94,7 +102,10 @@ func main() {
 		log.Print(err)
 		os.Exit(1)
 	}
-	runTray(a, statusUpdates)
+	if *updated {
+		log.Printf("updated to %s", version)
+	}
+	runTray(a, statusUpdates, *updateFeed)
 }
 
 func fatal(err error) {

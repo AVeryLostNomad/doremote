@@ -190,6 +190,13 @@ func (c *client) endSession(sid string) {
 	}
 }
 
+// inSession reports whether a remote session is running (or still restoring displays).
+func (c *client) inSession() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.current != nil
+}
+
 // shutdown cancels the running session and waits for its displays to be restored.
 func (c *client) shutdown() {
 	c.mu.Lock()

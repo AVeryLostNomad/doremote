@@ -24,6 +24,7 @@ type app struct {
 	cancel   context.CancelFunc // cancels the current pairing/connection attempt
 	unlinked bool
 	retry    chan struct{} // wakes a failed pairing when the user asks to sign in again
+	client   *client       // connected control channel, nil while pairing
 }
 
 func newApp(server, name string, status func(string)) (*app, error) {
@@ -86,8 +87,14 @@ func (a *app) run(ctx context.Context) error {
 
 		a.status("Connecting…")
 		c := &client{server: a.server, token: cfg.Token, name: a.name, isolate: func() bool { return !a.keepScreensOn.Load() }, status: a.status}
+		a.mu.Lock()
+		a.client = c
+		a.mu.Unlock()
 		err = c.run(attempt)
 		c.shutdown()
+		a.mu.Lock()
+		a.client = nil
+		a.mu.Unlock()
 		cancel()
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -126,6 +133,14 @@ func (a *app) takeUnlinked() bool {
 	u := a.unlinked
 	a.unlinked = false
 	return u
+}
+
+// inSession reports whether someone is connected remotely right now.
+func (a *app) inSession() bool {
+	a.mu.Lock()
+	c := a.client
+	a.mu.Unlock()
+	return c != nil && c.inSession()
 }
 
 func (a *app) setKeepScreensOn(on bool) {

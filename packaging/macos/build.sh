@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
-# Builds dist/doremote-macos.zip containing a universal (arm64 + x86_64), ad-hoc signed
-# doremote.app menu-bar app. Run on macOS with Go and Xcode command line tools.
+# Builds dist/doremote-macos.zip containing a universal (arm64 + x86_64) doremote.app menu-bar
+# app. Run on macOS with Go and Xcode command line tools.
 #   VERSION=1.2.3 packaging/macos/build.sh
+#
+# Signing: SIGN_IDENTITY names a "Developer ID Application" identity in the keychain; unset, the
+# first such identity found is used, and SIGN_IDENTITY=- (or none found) makes an ad-hoc build.
+# Developer ID builds use the hardened runtime and a secure timestamp. Their designated
+# requirement stays the same across versions, so Screen Recording/Accessibility grants survive
+# updates, and only they pass the auto-updater's signature check.
+#
+# Notarization (Developer ID builds only): NOTARY_PROFILE names a `xcrun notarytool
+# store-credentials` keychain profile, or APPLE_ID + APPLE_APP_PASSWORD (+ APPLE_TEAM_ID,
+# default: the signing identity's team) are passed directly. NOTARIZE=required fails the build
+# when neither is set.
 set -euo pipefail
 
 VERSION="${VERSION:-0.0.0-dev}"
@@ -33,10 +44,43 @@ for size in 16 32 128 256 512; do
 done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/doremote.icns"
 
-# Ad-hoc signature: required to run on Apple silicon. Without a Developer ID + notarization,
-# first launch needs right-click → Open (or System Settings → Privacy & Security → Open Anyway).
-codesign --force --deep --sign - --identifier dev.doremote.connector "$APP"
+if [ -z "${SIGN_IDENTITY:-}" ]; then
+  SIGN_IDENTITY="$(security find-identity -v -p codesigning | sed -n 's/.*"\(Developer ID Application: .*\)"$/\1/p' | head -n1)"
+  SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+fi
 
-rm -f "$DIST/doremote-macos.zip"
-ditto -c -k --keepParent "$APP" "$DIST/doremote-macos.zip"
-echo "built $DIST/doremote-macos.zip ($VERSION)"
+ZIP="$DIST/doremote-macos.zip"
+rm -f "$ZIP"
+if [ "$SIGN_IDENTITY" = "-" ]; then
+  # Ad-hoc: runs on Apple silicon, but macOS treats every build as a new app (permissions are
+  # asked again) and the updater rejects it.
+  codesign --force --sign - --identifier dev.doremote.connector "$APP"
+  ditto -c -k --keepParent "$APP" "$ZIP"
+  echo "built $ZIP ($VERSION, ad-hoc signed)"
+  exit 0
+fi
+
+codesign --force --sign "$SIGN_IDENTITY" --options runtime --timestamp "$APP"
+codesign --verify --strict --verbose=2 "$APP"
+ditto -c -k --keepParent "$APP" "$ZIP"
+
+TEAM_ID="${APPLE_TEAM_ID:-$(echo "$SIGN_IDENTITY" | sed -n 's/.*(\([A-Z0-9]*\))$/\1/p')}"
+if [ -n "${NOTARY_PROFILE:-}" ]; then
+  NOTARY_AUTH=(--keychain-profile "$NOTARY_PROFILE")
+elif [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_APP_PASSWORD:-}" ]; then
+  NOTARY_AUTH=(--apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$TEAM_ID")
+elif [ "${NOTARIZE:-}" = required ]; then
+  echo "NOTARIZE=required but neither NOTARY_PROFILE nor APPLE_ID + APPLE_APP_PASSWORD is set" >&2
+  exit 1
+else
+  echo "built $ZIP ($VERSION, signed by $SIGN_IDENTITY, not notarized)"
+  exit 0
+fi
+
+# The zip goes to Apple; the ticket is stapled to the app so Gatekeeper accepts it offline,
+# then the stapled app is zipped again.
+xcrun notarytool submit "$ZIP" "${NOTARY_AUTH[@]}" --wait --timeout 30m
+xcrun stapler staple "$APP"
+rm -f "$ZIP"
+ditto -c -k --keepParent "$APP" "$ZIP"
+echo "built $ZIP ($VERSION, signed by $SIGN_IDENTITY, notarized)"
