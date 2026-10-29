@@ -4,7 +4,7 @@ package platform
 #cgo CFLAGS: -fobjc-arc
 #cgo LDFLAGS: -framework Foundation -framework CoreGraphics -framework ApplicationServices -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo
 #include <stdlib.h>
-#include "darwin.h"
+#include "native_darwin.h"
 */
 import "C"
 

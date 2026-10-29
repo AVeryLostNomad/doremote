@@ -7,7 +7,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <sys/time.h>
-#include "darwin.h"
+#include "native_darwin.h"
 
 // ---- Private CoreGraphics virtual display API (macOS 11+; used by DeskPad, BetterDisplay, Chromium tests). ----
 
@@ -174,7 +174,7 @@ int dr_list_displays(uint32_t *ids, int cap) {
 }
 
 // Display isolation entry points. They run in a short-lived helper process (see
-// displayctl_darwin.go): after a display configuration transaction, the calling process's
+// runDisplayCtl in platform_darwin.go): after a display configuration transaction, the calling process's
 // CoreGraphics view of the display list stops updating, so the long-lived connector would
 // never see its next virtual display come online.
 
