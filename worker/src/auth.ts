@@ -260,7 +260,8 @@ export async function handleLogin(url: URL, env: Env): Promise<Response> {
   const cookieValue = await signJWT(stateClaims, env.SESSION_SECRET);
 
   const authorize = new URL("https://github.com/login/oauth/authorize");
-  authorize.searchParams.set("client_id", env.GITHUB_CLIENT_ID);
+  // Secrets pasted into `wrangler secret put` often carry stray whitespace; OAuth IDs never do.
+  authorize.searchParams.set("client_id", env.GITHUB_CLIENT_ID.trim());
   authorize.searchParams.set("redirect_uri", `${url.origin}/auth/callback`);
   authorize.searchParams.set("scope", "read:user");
   authorize.searchParams.set("state", state);
@@ -320,8 +321,8 @@ export async function handleCallback(request: Request, url: URL, env: Env): Prom
       "User-Agent": "doremote",
     },
     body: new URLSearchParams({
-      client_id: env.GITHUB_CLIENT_ID,
-      client_secret: env.GITHUB_CLIENT_SECRET,
+      client_id: env.GITHUB_CLIENT_ID.trim(),
+      client_secret: env.GITHUB_CLIENT_SECRET.trim(),
       code,
       redirect_uri: `${url.origin}/auth/callback`,
     }),
