@@ -33,6 +33,7 @@ const (
 	sdcUseDatabaseCurrent       = 0xF
 	sdcUseSuppliedDisplayConfig = 0x20
 	sdcApply                    = 0x80
+	sdcSaveToDatabase           = 0x200
 	sdcAllowChanges             = 0x400
 
 	displayConfigPathActive       = 0x1

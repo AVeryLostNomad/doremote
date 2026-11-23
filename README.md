@@ -41,7 +41,7 @@ Development builds (`0.0.0-dev`) and `-cli` never update. On macOS the bundle's 
 
 ### Display safety
 
-Switching screens off is undone when the session ends. If the connector dies mid-session, a guard process it spawned restores the displays immediately, and the next start re-checks a state file (`isolation-state.json` in the config directory). On macOS the display reconfiguration runs in short-lived helper processes because a process that reconfigures displays stops seeing later display changes.
+Switching screens off is undone when the session ends. On Windows the isolated layout is saved to the display database so Windows doesn't revert it when it re-evaluates the layout (e.g. on a monitor hot-plug event); Windows saves layouts per set of connected displays, so this only replaces the entry for your displays plus the virtual one, and your own layout comes back once the virtual display is unplugged. If Windows applies another layout mid-session anyway, the connector notices within half a second, switches the other screens off again and keeps streaming the virtual display; until then the picture freezes rather than showing another screen. If Windows keeps a screen on, or undoes the layout more than 3 times within a minute, the connector leaves the other screens on for the rest of the session instead of reconfiguring them in a loop. If the connector dies mid-session, a guard process it spawned restores the displays immediately, and the next start re-checks a state file (`isolation-state.json` in the config directory). On macOS the display reconfiguration runs in short-lived helper processes because a process that reconfigures displays stops seeing later display changes.
 
 ## Deploying the portal
 

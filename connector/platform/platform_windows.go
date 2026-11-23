@@ -31,6 +31,16 @@ const (
 	ddaRecoverTimeout = 5 * time.Second
 	vddAppearTimeout  = 6 * time.Second
 	vddPollInterval   = 100 * time.Millisecond
+	// displayCheckInterval paces verifying that the virtual display is still active (and alone,
+	// when isolating). Windows can apply another layout mid-session, e.g. when a switched-off
+	// monitor drops its hot-plug signal, and may give the virtual display a new GDI name.
+	displayCheckInterval = 500 * time.Millisecond
+	// displayLostTimeout ends a session whose virtual display can't be brought back.
+	displayLostTimeout = 10 * time.Second
+	// At most maxLayoutRestores layout restores per layoutRestoreWindow; beyond that the
+	// session stops switching other screens off instead of reconfiguring them in a loop.
+	maxLayoutRestores   = 3
+	layoutRestoreWindow = time.Minute
 )
 
 var errClosed = errors.New("session closed")
@@ -74,6 +84,15 @@ type winSession struct {
 	saved    *displayConfig
 	gdiName  string
 	done     chan struct{} // closed by Close to wake NextFrame
+
+	width, height    int // requested mode of the virtual display
+	isolate          bool
+	vddTarget        targetKey
+	displayChecked   time.Time   // last verification of the display layout
+	displayStale     bool        // verify the layout before the next capture
+	displayLostSince time.Time   // first poll the virtual display was unusable; zero while usable
+	restoredAt       time.Time   // last attempt to put the session's layout back
+	restores         []time.Time // layout restores within layoutRestoreWindow
 
 	dda             *ddaCapturer
 	ddaOff          bool // duplication unusable: GDI for the rest of the session
@@ -143,6 +162,9 @@ func Start(opts Options) (Session, error) {
 		vdd:         vdd,
 		saved:       saved,
 		done:        make(chan struct{}),
+		width:       width,
+		height:      height,
+		isolate:     opts.Isolate,
 		kick:        make(chan struct{}, 1),
 		heldKeys:    make(map[string]scanKey),
 		heldButtons: make(map[int]bool),
@@ -152,15 +174,18 @@ func Start(opts Options) (Session, error) {
 
 	if opts.Isolate {
 		ensureGuard()
-		// Isolation is applied without saving to the display database, so the database still
-		// holds the user's layout; Recover re-applies it if this process dies mid-session.
+		// Isolation is saved to the display database so Windows keeps it when it re-evaluates
+		// the layout (it re-applies saved layouts on hot-plug events). Windows keys saved
+		// layouts by the set of connected displays, so this only replaces the entry for the
+		// user's displays plus the virtual one; their own layout stays saved. Recover puts it
+		// back if this process dies mid-session.
 		if err := writeIsolationState(true); err != nil {
 			vdd.close()
 			return nil, fmt.Errorf("recording display layout: %w", err)
 		}
 	}
 
-	if err := s.setup(width, height, opts.Isolate, baseline); err != nil {
+	if err := s.setup(baseline); err != nil {
 		if cerr := s.Close(); cerr != nil {
 			err = errors.Join(err, fmt.Errorf("cleanup: %w", cerr))
 		}
@@ -177,6 +202,11 @@ func Recover() error {
 	if err != nil || !found {
 		return err
 	}
+	// The driver unplugs the virtual display once its owner stops pinging it. Until then the
+	// saved layout for the connected displays is the isolated one.
+	for deadline := time.Now().Add(2 * time.Second); vddActive() && time.Now().Before(deadline); {
+		time.Sleep(vddPollInterval)
+	}
 	if err := setDisplayConfig(nil, nil, sdcApply|sdcUseDatabaseCurrent); err != nil {
 		return fmt.Errorf("restore display configuration: %w", err)
 	}
@@ -184,7 +214,21 @@ func Recover() error {
 	return nil
 }
 
-func (s *winSession) setup(width, height int, isolate bool, baseline map[targetKey]bool) error {
+// vddActive reports whether a Parsec virtual display is part of the active layout.
+func vddActive() bool {
+	cfg, err := queryDisplayConfig(qdcOnlyActivePaths)
+	if err != nil {
+		return false
+	}
+	for i := range cfg.paths {
+		if isVDDTarget(&cfg.paths[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *winSession) setup(baseline map[targetKey]bool) error {
 	idx, err := s.vdd.addDisplay()
 	if err != nil {
 		return err
@@ -195,55 +239,258 @@ func (s *winSession) setup(width, height int, isolate bool, baseline map[targetK
 	if err != nil {
 		return err
 	}
-	vddTarget := cfg.paths[pathIdx].targetKey()
+	s.vddTarget = cfg.paths[pathIdx].targetKey()
+	if s.isolate {
+		if cfg, pathIdx, err = s.isolateVDD(cfg, pathIdx); err != nil {
+			return err
+		}
+	} else if cfg, pathIdx, err = s.extendVDD(cfg, baseline); err != nil {
+		return err
+	}
+	s.displayChecked = time.Now()
+	return s.adoptPath(&cfg.paths[pathIdx])
+}
 
-	if isolate {
-		paths, modes := isolatedConfig(cfg, pathIdx, width, height, true)
-		err := setDisplayConfig(paths, modes, sdcApply|sdcUseSuppliedDisplayConfig|sdcAllowChanges)
-		if err != nil {
-			paths, modes = isolatedConfig(cfg, pathIdx, width, height, false)
-			if err2 := setDisplayConfig(paths, modes, sdcApply|sdcUseSuppliedDisplayConfig|sdcAllowChanges); err2 != nil {
-				return fmt.Errorf("isolate virtual display: %w", errors.Join(err, err2))
-			}
-		}
-		// Re-resolve the path: indices shift after reconfiguration.
-		cfg, err = queryDisplayConfig(qdcOnlyActivePaths)
-		if err != nil {
-			return fmt.Errorf("query display configuration: %w", err)
-		}
-		pathIdx = -1
-		for i := range cfg.paths {
-			if cfg.paths[i].targetKey() == vddTarget {
-				pathIdx = i
-				break
-			}
-		}
-		if pathIdx < 0 {
-			return errors.New("virtual display became inactive after isolating it")
+// activePath returns the index of target's path in an active-paths configuration, or -1.
+func activePath(cfg *displayConfig, target targetKey) int {
+	for i := range cfg.paths {
+		if cfg.paths[i].targetKey() == target {
+			return i
 		}
 	}
+	return -1
+}
 
-	s.gdiName, err = getSourceGDIName(&cfg.paths[pathIdx])
+// extendVDD keeps the user's displays on beside the virtual display. Windows applies the
+// layout saved for this set of displays when the virtual display appears, which an isolated
+// session saved with them off; the extended layout replaces it.
+func (s *winSession) extendVDD(cfg *displayConfig, baseline map[targetKey]bool) (*displayConfig, int, error) {
+	on := make(map[targetKey]bool, len(baseline))
+	for i := range cfg.paths {
+		if k := cfg.paths[i].targetKey(); baseline[k] {
+			on[k] = true
+		}
+	}
+	idx := activePath(cfg, s.vddTarget)
+	if len(on) == len(baseline) {
+		return cfg, idx, nil
+	}
+	if err := setDisplayConfig(nil, nil, sdcApply|sdcTopologyExtend); err != nil {
+		return nil, 0, fmt.Errorf("turn displays back on: %w", err)
+	}
+	cfg, err := queryDisplayConfig(qdcOnlyActivePaths)
+	if err != nil {
+		return nil, 0, fmt.Errorf("query display configuration: %w", err)
+	}
+	if err := setDisplayConfig(cfg.paths, cfg.modes, sdcApply|sdcUseSuppliedDisplayConfig|sdcSaveToDatabase|sdcAllowChanges); err != nil {
+		log.Printf("display: save extended layout: %v", err)
+	}
+	if idx = activePath(cfg, s.vddTarget); idx < 0 {
+		return nil, 0, errors.New("virtual display became inactive after turning the other displays on")
+	}
+	return cfg, idx, nil
+}
+
+// isolateVDD makes the virtual display at cfg.paths[idx] the only active display and returns
+// the new active configuration with the display's path index in it. If Windows accepts the
+// layout but keeps other displays on, isolation is dropped for the rest of the session:
+// requesting it again would only reconfigure the screens over and over.
+func (s *winSession) isolateVDD(cfg *displayConfig, idx int) (*displayConfig, int, error) {
+	const flags = sdcApply | sdcUseSuppliedDisplayConfig | sdcSaveToDatabase | sdcAllowChanges
+	paths, modes := isolatedConfig(cfg, idx, s.width, s.height, true)
+	err := setDisplayConfig(paths, modes, flags)
+	if err != nil {
+		paths, modes = isolatedConfig(cfg, idx, s.width, s.height, false)
+		if err2 := setDisplayConfig(paths, modes, flags); err2 != nil {
+			return nil, 0, fmt.Errorf("isolate virtual display: %w", errors.Join(err, err2))
+		}
+	}
+	// Re-resolve the path: indices shift after reconfiguration.
+	cfg, err = queryDisplayConfig(qdcOnlyActivePaths)
+	if err != nil {
+		return nil, 0, fmt.Errorf("query display configuration: %w", err)
+	}
+	if idx = activePath(cfg, s.vddTarget); idx < 0 {
+		return nil, 0, errors.New("virtual display became inactive after isolating it")
+	}
+	if n := len(cfg.paths) - 1; n > 0 {
+		s.stopIsolating(fmt.Sprintf("Windows kept %d other display(s) on", n))
+	}
+	return cfg, idx, nil
+}
+
+// stopIsolating leaves the other displays as Windows has them for the rest of the session;
+// the virtual display is still followed and streamed.
+func (s *winSession) stopIsolating(reason string) {
+	log.Printf("display: %s; leaving other screens on for the rest of the session", reason)
+	s.isolate = false
+}
+
+// adoptPath captures the virtual display's source on path p from now on, switching it to the
+// requested mode if needed.
+func (s *winSession) adoptPath(p *pathInfo) error {
+	name, err := getSourceGDIName(p)
 	if err != nil {
 		return err
 	}
-
-	x, y, w, h, err := displayRect(s.gdiName)
+	x, y, w, h, err := displayRect(name)
 	if err != nil {
 		return err
 	}
-	if w != width || h != height {
+	if w != s.width || h != s.height {
 		// Best effort: on failure we keep whatever mode the display has.
-		_ = setDisplayResolution(s.gdiName, width, height)
-		if x, y, w, h, err = displayRect(s.gdiName); err != nil {
+		_ = setDisplayResolution(name, s.width, s.height)
+		if x, y, w, h, err = displayRect(name); err != nil {
 			return err
 		}
 	}
 	if w <= 0 || h <= 0 {
-		return fmt.Errorf("virtual display %s reports invalid size %dx%d", s.gdiName, w, h)
+		return fmt.Errorf("virtual display %s reports invalid size %dx%d", name, w, h)
 	}
+	s.setGDIName(name)
 	s.setGeom(x, y, w, h)
 	return nil
+}
+
+// setGDIName switches capture to the GDI display name; a duplication of the previous name
+// would keep showing whatever display now owns it.
+func (s *winSession) setGDIName(name string) {
+	if name == s.gdiName {
+		return
+	}
+	if s.gdiName != "" {
+		log.Printf("display: virtual display moved from %s to %s", s.gdiName, name)
+	}
+	s.gdiName = name
+	s.resetDuplication()
+}
+
+// resetDuplication recreates desktop duplication on the next capture. Failures while the
+// layout was wrong don't mean duplication can't work here, so a GDI fallback taken after
+// duplication had worked is undone too.
+func (s *winSession) resetDuplication() {
+	if s.dda != nil {
+		s.dda.close()
+		s.dda = nil
+	}
+	s.ddaFailingSince = time.Time{}
+	if s.ddaWorked {
+		s.ddaOff = false
+	}
+}
+
+// checkDisplay verifies that the virtual display is active (and the only active display when
+// isolating), restoring that layout if Windows changed it, and tracks its GDI name. It
+// reports whether the display can be captured now.
+func (s *winSession) checkDisplay() bool {
+	cfg, err := queryDisplayConfig(qdcOnlyActivePaths)
+	if err != nil {
+		return false
+	}
+	idx := activePath(cfg, s.vddTarget)
+	if idx >= 0 && (!s.isolate || len(cfg.paths) == 1) {
+		return s.followPath(&cfg.paths[idx])
+	}
+	now := time.Now()
+	if now.Sub(s.restoredAt) < displayCheckInterval {
+		return false
+	}
+	// Restores within the last layoutRestoreWindow; past maxLayoutRestores, Windows (or a
+	// monitor that keeps reconnecting) is undoing them faster than they help.
+	recent := s.restores[:0]
+	for _, t := range s.restores {
+		if now.Sub(t) < layoutRestoreWindow {
+			recent = append(recent, t)
+		}
+	}
+	s.restores = recent
+	if len(s.restores) >= maxLayoutRestores {
+		if !s.isolate {
+			return false // the virtual display keeps going away; displayLostTimeout ends the session
+		}
+		s.stopIsolating(fmt.Sprintf("Windows changed the layout %d times within %s", len(s.restores), layoutRestoreWindow))
+		if idx >= 0 {
+			return s.followPath(&cfg.paths[idx])
+		}
+	}
+	s.restoredAt = now
+	s.restores = append(s.restores, now)
+	log.Printf("display: layout changed (virtual display active: %v, %d active displays); restoring it", idx >= 0, len(cfg.paths))
+	if idx < 0 {
+		// The extend topology activates every connected display, the virtual one included.
+		if err := setDisplayConfig(nil, nil, sdcApply|sdcTopologyExtend); err != nil {
+			log.Printf("display: reactivate virtual display: %v", err)
+			return false
+		}
+		if cfg, err = queryDisplayConfig(qdcOnlyActivePaths); err != nil {
+			return false
+		}
+		if idx = activePath(cfg, s.vddTarget); idx < 0 {
+			log.Printf("display: virtual display is still inactive")
+			return false
+		}
+	}
+	if s.isolate {
+		icfg, iidx, err := s.isolateVDD(cfg, idx)
+		if err != nil {
+			s.stopIsolating(err.Error())
+			// The failed attempt may still have changed the layout.
+			if cfg, err = queryDisplayConfig(qdcOnlyActivePaths); err != nil {
+				return false
+			}
+			if idx = activePath(cfg, s.vddTarget); idx < 0 {
+				return false
+			}
+		} else {
+			cfg, idx = icfg, iidx
+		}
+	}
+	if err := s.adoptPath(&cfg.paths[idx]); err != nil {
+		log.Printf("display: %v", err)
+		return false
+	}
+	s.resetDuplication()
+	log.Printf("display: restored virtual display %s", s.gdiName)
+	return true
+}
+
+// followPath captures the virtual display's source on path p without changing the layout.
+func (s *winSession) followPath(p *pathInfo) bool {
+	name, err := getSourceGDIName(p)
+	if err != nil {
+		return false
+	}
+	s.setGDIName(name)
+	return true
+}
+
+// display returns the virtual display's desktop rectangle, verifying the layout every
+// displayCheckInterval or when capture failed. w == 0 means nothing can be captured now: the
+// session shows its last picture rather than another display.
+func (s *winSession) display() (x, y, w, h int, err error) {
+	now := time.Now()
+	ok := true
+	if s.displayStale || now.Sub(s.displayChecked) >= displayCheckInterval {
+		ok = s.checkDisplay()
+		s.displayChecked = now
+	}
+	if ok {
+		x, y, w, h, err = displayRect(s.gdiName)
+		ok = err == nil && w > 0 && h > 0
+	}
+	if ok {
+		s.displayStale = false
+		s.displayLostSince = time.Time{}
+		s.setGeom(x, y, w, h)
+		return x, y, w, h, nil
+	}
+	s.displayStale = true
+	if s.displayLostSince.IsZero() {
+		s.displayLostSince = now
+	} else if now.Sub(s.displayLostSince) > displayLostTimeout {
+		return 0, 0, 0, 0, fmt.Errorf("virtual display lost for %s", displayLostTimeout)
+	}
+	return 0, 0, 0, 0, nil
 }
 
 // waitForVDDPath polls the active display paths until the freshly plugged
@@ -352,14 +599,13 @@ func (s *winSession) poll() (*VideoFrame, time.Duration, error) {
 	if s.closed.Load() {
 		return nil, 0, errClosed
 	}
-	x, y, w, h, err := displayRect(s.gdiName)
+	x, y, w, h, err := s.display()
 	if err != nil {
-		return nil, 0, fmt.Errorf("virtual display lost: %w", err)
+		return nil, 0, err
 	}
-	if w <= 0 || h <= 0 {
-		return nil, gdiPollInterval, nil
+	if w == 0 {
+		return nil, displayCheckInterval, nil
 	}
-	s.setGeom(x, y, w, h)
 
 	// due is when an unchanged picture is re-encoded anyway: now for a requested keyframe,
 	// RefineDelay after the last frame for a refinement.
@@ -404,6 +650,7 @@ func (s *winSession) capture(x, y, w, h int, budget time.Duration) (changed bool
 	if !s.ddaOff && s.dda == nil {
 		c, err := newDDACapturer(s.gdiName)
 		if err != nil {
+			s.displayStale = true // e.g. the display's GDI name changed
 			if !s.ddaGiveUp(err) {
 				return false, ddaRetryInterval, nil
 			}
@@ -417,6 +664,7 @@ func (s *winSession) capture(x, y, w, h int, budget time.Duration) (changed bool
 		case err != nil:
 			s.dda.close()
 			s.dda = nil
+			s.displayStale = true
 			if !s.ddaGiveUp(err) {
 				return false, 0, nil // recreate on the next poll
 			}
