@@ -3,6 +3,8 @@
 # version info and a manifest. Pure Go, so it runs on any OS with Go installed.
 #   VERSION=1.2.3 packaging/windows/build.sh
 # CONSOLE=1 builds console-subsystem binaries instead (for -selftest output in CI).
+# SETUP=1 also builds dist/doremote-setup.exe (packaging/windows/doremote.iss, both
+# architectures) with Inno Setup 6's compiler: ISCC (default ISCC.exe on PATH).
 set -euo pipefail
 
 VERSION="${VERSION:-0.0.0-dev}"
@@ -33,3 +35,11 @@ for arch in amd64 arm64; do
     -o "$DIST/doremote-windows-$arch$SUFFIX.exe" .
 done
 echo "built $DIST/doremote-windows-{amd64,arm64}$SUFFIX.exe ($VERSION)"
+
+if [ "${SETUP:-}" = 1 ]; then
+  ISS="$ROOT/packaging/windows/doremote.iss"
+  if command -v cygpath >/dev/null; then ISS="$(cygpath -w "$ISS")"; fi
+  # MSYS2_ARG_CONV_EXCL keeps Git Bash from rewriting /D... into a Windows path.
+  MSYS2_ARG_CONV_EXCL='*' "${ISCC:-ISCC.exe}" /Q "/DAppVersion=$NUMERIC" "$ISS"
+  echo "built $DIST/doremote-setup.exe ($VERSION)"
+fi

@@ -44,10 +44,10 @@ type updateAsset struct {
 	SHA256 string `json:"sha256"`
 }
 
-// stagedUpdate is a downloaded, verified release sitting next to the installed copy.
+// stagedUpdate is a downloaded, verified release ready to install.
 type stagedUpdate interface {
-	// install swaps the new version in and launches it with args; on error the installed copy
-	// is left as it was.
+	// install puts the new version in place and gets it started (macOS with args); on error
+	// the installed copy is left as it was.
 	install(args []string) error
 	discard()
 }

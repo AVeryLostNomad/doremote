@@ -2,34 +2,25 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 )
 
-func updateAssetKey() string { return "windows-" + runtime.GOARCH }
+// Windows updates run the release's per-user installer (packaging/windows/doremote.iss)
+// silently. It needs no admin rights, waits for this process to quit, replaces doremote.exe in
+// %LOCALAPPDATA%\Programs\doremote and starts it again with -updated (the previous copy, if
+// installing failed). Other command-line flags aren't carried over.
+func updateAssetKey() string { return "windows-setup" }
+
+const setupPattern = "doremote-setup-*.exe"
 
 type windowsUpdate struct {
-	exe string // installed executable
-	new string // verified download next to it (same volume, so renames work)
-}
-
-func installedExe() (string, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return "", err
-	}
-	return filepath.EvalSymlinks(exe)
+	setup string // verified installer in the temp directory
 }
 
 func stageUpdate(ctx context.Context, url string, sha []byte) (stagedUpdate, error) {
-	exe, err := installedExe()
-	if err != nil {
-		return nil, err
-	}
-	f, err := os.CreateTemp(filepath.Dir(exe), ".doremote-update-*.exe")
+	f, err := os.CreateTemp("", setupPattern)
 	if err != nil {
 		return nil, err
 	}
@@ -39,45 +30,31 @@ func stageUpdate(ctx context.Context, url string, sha []byte) (stagedUpdate, err
 	if err := downloadVerified(ctx, url, name, sha); err != nil {
 		return nil, err
 	}
-	return &windowsUpdate{exe: exe, new: name}, nil
+	return &windowsUpdate{setup: name}, nil
 }
 
-// install relies on Windows allowing a running executable to be renamed (not deleted).
-func (u *windowsUpdate) install(args []string) error {
-	old := u.exe + ".old"
-	os.Remove(old)
-	if err := os.Rename(u.exe, old); err != nil {
-		return err
-	}
-	rollback := func(err error) error {
-		os.Remove(u.exe)
-		if rerr := os.Rename(old, u.exe); rerr != nil {
-			return fmt.Errorf("%w; restoring the previous version also failed: %v", err, rerr)
-		}
-		return err
-	}
-	if err := os.Rename(u.new, u.exe); err != nil {
-		return rollback(err)
-	}
-	cmd := exec.Command(u.exe, args...)
+func (u *windowsUpdate) install([]string) error {
+	cmd := exec.Command(u.setup, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-",
+		"/LOG="+filepath.Join(os.TempDir(), "doremote-setup.log"))
 	if err := cmd.Start(); err != nil {
-		return rollback(fmt.Errorf("launching: %w", err))
+		return err
 	}
 	cmd.Process.Release()
 	return nil
 }
 
-func (u *windowsUpdate) discard() { os.Remove(u.new) }
+func (u *windowsUpdate) discard() { os.Remove(u.setup) }
 
-// cleanupUpdate removes the previous version and unfinished downloads next to the executable.
+// cleanupUpdate removes installers left by earlier updates, and the previous executable that
+// in-place updates of versions before the installer left next to this one.
 func cleanupUpdate() {
-	exe, err := installedExe()
-	if err != nil {
-		return
-	}
-	os.Remove(exe + ".old")
-	leftovers, _ := filepath.Glob(filepath.Join(filepath.Dir(exe), ".doremote-update-*.exe"))
+	leftovers, _ := filepath.Glob(filepath.Join(os.TempDir(), setupPattern))
 	for _, p := range leftovers {
 		os.Remove(p)
+	}
+	if exe, err := os.Executable(); err == nil {
+		if exe, err = filepath.EvalSymlinks(exe); err == nil {
+			os.Remove(exe + ".old")
+		}
 	}
 }

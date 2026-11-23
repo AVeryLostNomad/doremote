@@ -2,8 +2,9 @@ name: Release
 
 # Every push to main that touches the connector cuts a release: the next patch version (or the
 # bump chosen when run by hand) is built for macOS (Developer ID signed, notarized, stapled) and
-# Windows, then published with update.json + update.json.sig, which installed connectors poll
-# and verify against the Ed25519 key compiled into them (connector/update.go).
+# Windows (doremote-setup.exe, a per-user Inno Setup installer, plus the bare executables), then
+# published with update.json + update.json.sig, which installed connectors poll and verify
+# against the Ed25519 key compiled into them (connector/update.go).
 #
 # Secrets live in the "release" environment, which only main may deploy to:
 #   MACOS_CERT_P12, MACOS_CERT_PASSWORD  Developer ID Application identity (base64 .p12)
@@ -125,7 +126,10 @@ jobs:
 
   windows:
     needs: version
-    runs-on: ubuntu-latest
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -134,14 +138,20 @@ jobs:
         with:
           go-version-file: connector/go.mod
           cache: false
-      - name: Build doremote.exe (amd64, arm64)
+      - name: Install Inno Setup
+        run: packaging/windows/install-inno.sh
+      - name: Build doremote.exe (amd64, arm64) and doremote-setup.exe
         env:
           VERSION: ${{ needs.version.outputs.version }}
+          SETUP: "1"
+          ISCC: C:\inno\ISCC.exe
         run: packaging/windows/build.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows
-          path: dist/doremote-windows-*.exe
+          path: |
+            dist/doremote-windows-*.exe
+            dist/doremote-setup.exe
           if-no-files-found: error
 
   release:
@@ -167,12 +177,16 @@ jobs:
         run: |
           cd dist
           sha() { sha256sum "$1" | cut -d' ' -f1; }
+          # windows-amd64/-arm64 serve connectors from before the installer, which replace their
+          # executable in place; current ones run windows-setup.
           jq -n --arg v "$VERSION" \
             --arg mac "$(sha doremote-macos.zip)" \
+            --arg setup "$(sha doremote-setup.exe)" \
             --arg amd64 "$(sha doremote-windows-amd64.exe)" \
             --arg arm64 "$(sha doremote-windows-arm64.exe)" \
             '{version: $v, assets: {
                "darwin": {file: "doremote-macos.zip", sha256: $mac},
+               "windows-setup": {file: "doremote-setup.exe", sha256: $setup},
                "windows-amd64": {file: "doremote-windows-amd64.exe", sha256: $amd64},
                "windows-arm64": {file: "doremote-windows-arm64.exe", sha256: $arm64}}}' > update.json
           cat update.json
@@ -194,6 +208,6 @@ jobs:
         run: |
           gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "v$VERSION" --generate-notes \
-            --notes "Installed connectors update themselves. New install: **macOS** \`doremote-macos.zip\` (unzip, move doremote.app to Applications); **Windows** \`doremote-windows-amd64.exe\` (\`-arm64\` for ARM PCs; SmartScreen may need More info → Run anyway)." \
-            dist/doremote-macos.zip dist/doremote-windows-amd64.exe dist/doremote-windows-arm64.exe \
+            --notes "Installed connectors update themselves. New install: **macOS** \`doremote-macos.zip\` (unzip, move doremote.app to Applications); **Windows** \`doremote-setup.exe\` (no admin needed; SmartScreen may need More info → Run anyway)." \
+            dist/doremote-macos.zip dist/doremote-setup.exe dist/doremote-windows-amd64.exe dist/doremote-windows-arm64.exe \
             dist/update.json dist/update.json.sig

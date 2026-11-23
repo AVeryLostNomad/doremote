@@ -2,11 +2,13 @@ name: Windows self-test
 
 # Exercises the Windows virtual display path on a real Windows machine: installs the Parsec
 # Virtual Display Driver, then runs `doremote -selftest` (virtual display, isolation, capture,
-# H.264 encoding, input injection, restore) and uploads the encoded frames.
+# H.264 encoding, input injection, restore) and uploads the encoded frames. The installer job
+# installs doremote-setup.exe, installs it again over the running connector the way an update
+# does, and uninstalls it.
 on:
   push:
     branches: [main]
-    paths: ["connector/**", ".github/workflows/windows-selftest.yml"]
+    paths: ["connector/**", "packaging/windows/**", ".github/workflows/windows-selftest.yml"]
   workflow_dispatch:
 
 permissions:
@@ -60,3 +62,76 @@ jobs:
           name: windows-selftest
           path: selftest-*.h264
           if-no-files-found: warn
+
+  installer:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: connector/go.mod
+          cache-dependency-path: connector/go.sum
+      - name: Build doremote-setup.exe
+        shell: bash
+        env:
+          VERSION: 0.0.1
+          SETUP: "1"
+          ISCC: C:\inno\ISCC.exe
+        run: |
+          packaging/windows/install-inno.sh
+          packaging/windows/build.sh
+      - name: Install, update over the running connector, uninstall
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\doremote'
+          $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+          function Connectors { @(Get-CimInstance Win32_Process -Filter "Name = 'doremote.exe'") }
+          # WaitForExit, not Start-Process -Wait: that also waits for descendants, which include
+          # the connector setup starts.
+          function Run([string]$exe, [string[]]$arguments) {
+            $p = Start-Process $exe -ArgumentList $arguments -PassThru
+            $null = $p.Handle # keeps ExitCode readable after the process exits
+            $p.WaitForExit()
+            if ($p.ExitCode -ne 0) { throw "$exe exited with $($p.ExitCode)" }
+          }
+          function Setup([string]$log) {
+            try { Run dist\doremote-setup.exe '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',"/LOG=$log" }
+            finally { Get-Content $log -ErrorAction SilentlyContinue | Select-String 'stop-doremote|doremote processes|waiting up|stopping|Starting the installation|succeeded|Exception|Error' }
+          }
+          function WaitRunning {
+            for ($i = 0; $i -lt 40 -and (Connectors).Count -eq 0; $i++) { Start-Sleep -Milliseconds 250 }
+            if ((Connectors).Count -eq 0) { throw 'connector is not running' }
+          }
+
+          Setup "$env:RUNNER_TEMP\install.log"
+          if (-not (Test-Path "$dir\doremote.exe")) { throw 'doremote.exe not installed' }
+          if ((Get-ItemProperty $run).doremote -ne "`"$dir\doremote.exe`"") { throw 'autostart entry missing' }
+          WaitRunning
+          Start-Sleep -Seconds 5
+          $first = (Connectors).ProcessId
+          if (-not $first) { throw 'connector quit after starting' }
+          "installed; connector running as $first"
+
+          # An update: setup waits 30 s for the connector to quit by itself (an updating one
+          # does), stops it, installs and starts the installed copy again.
+          $t = [Diagnostics.Stopwatch]::StartNew()
+          Setup "$env:RUNNER_TEMP\update.log"
+          "update took $($t.Elapsed.TotalSeconds) s"
+          if ($t.Elapsed.TotalSeconds -lt 25) { throw 'setup did not wait for the running connector' }
+          WaitRunning
+          $second = (Connectors).ProcessId
+          if (Compare-Object @($first) @($second) -IncludeEqual -ExcludeDifferent) { throw "connector $first was not restarted" }
+          "updated; connector running as $second"
+
+          Run "$dir\unins000.exe" '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+          # The uninstaller finishes from a temporary copy of itself.
+          for ($i = 0; $i -lt 60 -and (Test-Path "$dir\doremote.exe"); $i++) { Start-Sleep -Milliseconds 500 }
+          if (Test-Path "$dir\doremote.exe") { throw 'doremote.exe still installed' }
+          if ($null -ne (Get-ItemProperty $run).doremote) { throw 'autostart entry left behind' }
+          if ((Connectors).Count -ne 0) { throw 'connector still running after uninstall' }
+          'uninstalled'

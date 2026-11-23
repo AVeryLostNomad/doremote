@@ -14,13 +14,13 @@ flowchart LR
 | --- | --- | --- |
 | Portal + relay | `worker/` | Cloudflare Worker, Durable Objects (hibernatable WebSockets), static assets, GitHub OAuth |
 | Connector | `connector/` | Go; macOS: CGVirtualDisplay + ScreenCaptureKit + VideoToolbox H.264 + CGEvent (cgo); Windows: Parsec Virtual Display Driver + CCD display API + DXGI Desktop Duplication (GDI fallback) + Media Foundation H.264 + SendInput |
-| Packaging | `packaging/`, `.github/workflows/` | universal Developer ID signed `doremote.app`, `doremote.exe` with icon/manifest, GitHub release on every connector change to `main` |
+| Packaging | `packaging/`, `.github/workflows/` | universal Developer ID signed `doremote.app`, per-user Inno Setup installer `doremote-setup.exe` for Windows, GitHub release on every connector change to `main` |
 
 ## Using it
 
 **macOS (13+)**: download `doremote-macos.zip` from the latest release, unzip, move `doremote.app` to Applications and open it. It lives in the menu bar. Grant **Screen Recording** and **Accessibility** when asked (or via the menu's ⚠ item), then quit and reopen it. The app is Developer ID signed, so the grants survive updates.
 
-**Windows 10/11**: download `doremote-windows-amd64.exe` (`-arm64` for ARM PCs) and run it; SmartScreen may need **More info → Run anyway**. It lives in the notification area. The first time, choose **Install the virtual display driver…** (installs [Parsec VDD](https://github.com/nomi-san/parsec-vdd), needs admin).
+**Windows 10/11**: download `doremote-setup.exe` from the latest release and run it; SmartScreen may need **More info → Run anyway**. It installs for your Windows user only, without admin rights, into `%LOCALAPPDATA%\Programs\doremote`, adds a Start menu entry, starts with Windows unless you untick that, and can be removed from **Settings → Apps**. The app lives in the notification area. The first time, choose **Install the virtual display driver…** (installs [Parsec VDD](https://github.com/nomi-san/parsec-vdd), needs admin). Bare `doremote-windows-{amd64,arm64}.exe` files are on each release too; they run from anywhere and update through the installer.
 
 On first launch the browser opens doremote.dev: sign in with GitHub and click **Connect**. The computer then appears in the portal whenever the app is running, for any browser signed in with the same GitHub account. Set its resolution on the portal card, then **Connect**.
 
@@ -30,7 +30,7 @@ Command-line flags (handy for development): `-cli` (no tray, logs to the termina
 
 ### Updates
 
-The menu-bar/tray app checks the latest GitHub release a minute after start and hourly. A newer version is downloaded next to the installed copy, verified, and installed once no remote session is running: the app swaps itself out, starts the new version and quits. Verification, all of which must pass:
+The menu-bar/tray app checks the latest GitHub release a minute after start and hourly. A newer version is downloaded and verified, then installed once no remote session is running. On macOS the app swaps its bundle out, starts the new version and quits. On Windows it runs `doremote-setup.exe` silently and quits; setup waits for it to exit (stopping it after 30 seconds), installs the new version and starts it, or starts the previous one again if installing failed. No admin rights or UAC prompts are involved, so unattended machines update too. Verification, all of which must pass:
 
 - `update.json` (version and SHA-256 of each download) must carry a valid Ed25519 signature (`update.json.sig`) from the key in `connector/update.go`. Its private key exists only as the `UPDATE_SIGNING_KEY` secret of the `release` environment, so tampered release assets are rejected.
 - The version must be higher than the running one, so an old signed manifest can't roll a machine back.
@@ -64,8 +64,8 @@ Every push to `main` that touches `connector/`, `packaging/` or the workflow run
 
 1. Picks the next patch version after the highest `v*` tag. Run it by hand (Actions → Release → Run workflow) to bump minor or major instead.
 2. Builds `doremote-macos.zip` on a macOS runner: universal, signed with the Developer ID identity from a temporary keychain, hardened runtime, notarized and stapled.
-3. Cross-compiles `doremote-windows-{amd64,arm64}.exe`.
-4. Writes and signs `update.json`, checks the signature against the key the connectors trust, and publishes release `vX.Y.Z` with all five files.
+3. Builds `doremote-windows-{amd64,arm64}.exe` and the installer `doremote-setup.exe` (Inno Setup 6, pinned and checksum-verified by `packaging/windows/install-inno.sh`) on a Windows runner.
+4. Writes and signs `update.json`, checks the signature against the key the connectors trust, and publishes release `vX.Y.Z` with all six files. Connectors from before the installer update by replacing their executable (`windows-amd64`/`windows-arm64` in `update.json`); current ones run the installer (`windows-setup`).
 
 Releases run one at a time. Several merges in a row collapse into one release of the latest commit.
 
